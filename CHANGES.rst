@@ -6,12 +6,20 @@ Unreleased
 
 **New features:**
 
+- Fields assigned an expression (e.g. ``F()`` objects) are now refreshed from the
+  database before creating the historical record, so the snapshot stores the value
+  computed by the database instead of the unevaluated expression
+- ``GeneratedField`` values are now captured in historical records; the historical
+  model stores them in a plain field of the generated field's output type instead of
+  recomputing the expression
 
 **Breaking changes:**
 
 
 **Bug fixes:**
 
+- Deferred fields included in the historical record are now loaded with a single
+  query instead of one query per field when creating the historical record
 
 **Other changes:**
 

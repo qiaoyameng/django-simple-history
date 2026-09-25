@@ -40,6 +40,19 @@ class PollWithNonEditableField(models.Model):
     history = HistoricalRecords()
 
 
+class PollWithGeneratedField(models.Model):
+    question = models.CharField(max_length=200)
+    count = models.IntegerField(default=0)
+    db_default_count = models.IntegerField(db_default=0)
+    double_count = models.GeneratedField(
+        expression=models.F("count") * 2,
+        output_field=models.IntegerField(),
+        db_persist=True,
+    )
+
+    history = HistoricalRecords()
+
+
 class PollWithUniqueQuestion(models.Model):
     question = models.CharField(max_length=200, unique=True)
     pub_date = models.DateTimeField("date published")

@@ -14,6 +14,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.db import models
 from django.db.models import ManyToManyField
+from django.db.models.expressions import BaseExpression
 from django.db.models.fields.proxy import OrderWrt
 from django.db.models.fields.related import ForeignKey
 from django.db.models.fields.related_descriptors import (
@@ -353,7 +354,9 @@ class HistoricalRecords:
             if isinstance(field, OrderWrt):
                 # OrderWrt is a proxy field, switch to a plain IntegerField
                 field.__class__ = models.IntegerField
-            if isinstance(field, models.ForeignKey):
+            if isinstance(field, models.GeneratedField):
+                field = self.convert_generated_field(field)
+            elif isinstance(field, models.ForeignKey):
                 old_field = field
                 old_swappable = old_field.swappable
                 old_field.swappable = False
@@ -405,6 +408,21 @@ class HistoricalRecords:
 
             fields[field.name] = field
         return fields
+
+    def convert_generated_field(self, field):
+        """
+        Convert a GeneratedField into a plain field of its output type, so
+        that the historical record stores the value computed by the database
+        at the time of the change instead of recomputing the expression
+        (which may no longer match the stored data) on every read.
+        """
+        plain_field = copy.copy(field.output_field)
+        plain_field.name = field.name
+        plain_field.attname = field.attname
+        plain_field.column = field.column
+        plain_field.verbose_name = field.verbose_name
+        transform_field(plain_field)
+        return plain_field
 
     def _get_history_change_reason_field(self):
         if self.history_change_reason_field:
@@ -749,6 +767,9 @@ class HistoricalRecords:
         )
         manager = getattr(instance, self.manager_name)
 
+        if history_type != "-":
+            self.load_unsaved_instance_values(instance, created=history_type == "+")
+
         attrs = {}
         for field in self.fields_included(instance):
             attrs[field.attname] = getattr(instance, field.attname)
@@ -787,6 +808,40 @@ class HistoricalRecords:
             history_change_reason=history_change_reason,
             using=using,
         )
+
+    def load_unsaved_instance_values(self, instance, created):
+        """
+        Load concrete values for fields whose in-memory value does not reflect
+        what was just written to the database:
+
+        - fields assigned an expression (e.g. ``F()`` objects), which the
+          database evaluates during the write,
+        - generated fields, which Django only refreshes on insert,
+        - deferred fields, which are not loaded on the instance at all.
+
+        Everything is loaded with a single query against the database the
+        instance was saved to (called from ``post_save``, i.e. within the same
+        transaction as the write), so the historical record reflects this
+        write and cannot pick up another transaction's later changes.
+        """
+        deferred_field_attnames = instance.get_deferred_fields()
+        fields_to_load = []
+        for field in self.fields_included(instance):
+            if field.attname in deferred_field_attnames:
+                fields_to_load.append(field.attname)
+                continue
+            if field.generated:
+                # Django populates generated fields on insert (on backends
+                # supporting RETURNING), but never on update.
+                if not created or field.attname not in instance.__dict__:
+                    fields_to_load.append(field.attname)
+                continue
+            if isinstance(instance.__dict__.get(field.attname), BaseExpression):
+                fields_to_load.append(field.attname)
+        if fields_to_load:
+            # ``using=None`` makes refresh_from_db() read from the database
+            # the instance was saved to, honoring custom database aliases.
+            instance.refresh_from_db(fields=fields_to_load)
 
     def get_history_user(self, instance):
         """Get the modifying user from instance or middleware."""

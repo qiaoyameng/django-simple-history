@@ -13,7 +13,7 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.files.base import ContentFile
 from django.db import IntegrityError, models
-from django.db.models import Prefetch
+from django.db.models import F, Prefetch
 from django.db.models.fields.proxy import OrderWrt
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -99,6 +99,7 @@ from ..models import (
     PollWithExcludedFieldsWithDefaults,
     PollWithExcludedFKField,
     PollWithExcludeFields,
+    PollWithGeneratedField,
     PollWithHistoricalIPAddress,
     PollWithManyToMany,
     PollWithManyToManyCustomHistoryID,
@@ -3145,3 +3146,81 @@ class HistoricOneToOneFieldTest(TestCase):
         )[0]
         pt1i = pt1h.instance
         self.assertEqual(pt1i.organization.name, "original")
+
+
+class ExpressionAssignmentAndGeneratedFieldTest(TestCase):
+    databases = {"default", "other"}
+
+    def test_f_expression_saved_as_computed_value(self):
+        poll = PollWithGeneratedField.objects.create(question="q")
+        poll.count = F("count") + 1
+        poll.save()
+        record = poll.history.latest()
+        self.assertIsInstance(record.count, int)
+        self.assertEqual(record.count, 1)
+
+    def test_two_saves_produce_distinct_snapshots(self):
+        poll = PollWithGeneratedField.objects.create(question="q", count=1)
+        poll.count = F("count") + 1
+        poll.save()
+        records = list(poll.history.order_by("history_date", "history_id"))
+        self.assertEqual(len(records), 2)
+        self.assertEqual((records[0].count, records[0].double_count), (1, 2))
+        self.assertEqual((records[1].count, records[1].double_count), (2, 4))
+
+    def test_generated_field_is_plain_field_on_history_model(self):
+        history_model = get_history_model_for_model(PollWithGeneratedField)
+        field = history_model._meta.get_field("double_count")
+        self.assertFalse(field.generated)
+        self.assertNotIsInstance(field, models.GeneratedField)
+        self.assertIsInstance(field, models.IntegerField)
+
+    def test_generated_field_stores_value_at_the_time(self):
+        poll = PollWithGeneratedField.objects.create(question="q", count=1)
+        poll.count = F("count") + 1
+        poll.save()
+        # Change the row without creating a historical record; the stored
+        # snapshot must keep the value computed at the time of the save.
+        PollWithGeneratedField.objects.filter(pk=poll.pk).update(count=100)
+        records = list(poll.history.order_by("history_date", "history_id"))
+        self.assertEqual([r.double_count for r in records], [2, 4])
+
+    def test_update_fields_with_expression(self):
+        poll = PollWithGeneratedField.objects.create(question="q", count=5)
+        poll.question = "changed"
+        poll.count = F("count") + 1
+        poll.save(update_fields=["count"])
+        record = poll.history.latest()
+        self.assertEqual(record.count, 6)
+        self.assertEqual(record.double_count, 12)
+
+    def test_db_default_value_captured(self):
+        poll = PollWithGeneratedField(question="q")
+        poll.save()
+        record = poll.history.latest()
+        self.assertEqual(record.db_default_count, 0)
+
+    def test_deferred_fields_loaded_with_single_query(self):
+        poll = PollWithGeneratedField.objects.create(question="q", count=3)
+        poll = PollWithGeneratedField.objects.defer(
+            "question", "db_default_count"
+        ).get(pk=poll.pk)
+        poll.count = F("count") + 1
+        # UPDATE + one SELECT loading the expression/deferred/generated
+        # fields + INSERT of the historical record
+        with self.assertNumQueries(3):
+            poll.save()
+        record = poll.history.latest()
+        self.assertEqual(record.question, "q")
+        self.assertEqual(record.db_default_count, 0)
+        self.assertEqual(record.count, 4)
+        self.assertEqual(record.double_count, 8)
+
+    def test_save_using_other_database_alias(self):
+        poll = PollWithGeneratedField(question="q", count=2)
+        poll.save(using="other")
+        poll.count = F("count") + 1
+        poll.save(using="other")
+        record = poll.history.latest()
+        self.assertEqual(record.count, 3)
+        self.assertEqual(record.double_count, 6)

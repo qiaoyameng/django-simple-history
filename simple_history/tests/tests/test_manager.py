@@ -7,7 +7,7 @@ from django.test import TestCase, override_settings, skipUnlessDBFeature
 
 from simple_history.manager import SIMPLE_HISTORY_REVERSE_ATTR_NAME
 
-from ..models import Choice, Document, Poll, RankedDocument
+from ..models import Choice, Document, Poll, RankedDocument, UUIDModel
 from .utils import HistoricalTestCase
 
 User = get_user_model()
@@ -65,6 +65,158 @@ class LatestOfEachTestCase(HistoricalTestCase):
                 "history_type": "+",
             },
         )
+
+
+class SameTimestampOrderingTestCase(TestCase):
+    """
+    `latest_of_each()` and `as_of()` must agree on a stable total ordering of
+    `history_date` + history primary key when records share a `history_date`.
+    """
+
+    def _create_same_timestamp_records(self, **kwargs):
+        """
+        Create a `RankedDocument` with two history records (create + update)
+        sharing the exact same `history_date`, and return the two records in
+        history-id order.
+        """
+        document = RankedDocument.objects.create(**kwargs)
+        document.rank += 1
+        document.save()
+        create_record, update_record = RankedDocument.history.filter(
+            id=document.id
+        ).order_by("history_id")
+        update_record.history_date = create_record.history_date
+        update_record.save()
+        return document, create_record, update_record
+
+    def test_latest_of_each_dedupes_same_timestamp_updates(self):
+        document, create_record, update_record = self._create_same_timestamp_records(
+            rank=10
+        )
+        records = list(RankedDocument.history.latest_of_each())
+        self.assertEqual(records, [update_record])
+        self.assertEqual(records[0].rank, 11)
+
+    def test_as_of_queryset_dedupes_same_timestamp_updates(self):
+        document, create_record, update_record = self._create_same_timestamp_records(
+            rank=10
+        )
+        as_of_list = list(
+            RankedDocument.history.as_of(datetime.now() + timedelta(days=1))
+        )
+        self.assertEqual(len(as_of_list), 1)
+        self.assertEqual(as_of_list[0].pk, document.pk)
+        self.assertEqual(as_of_list[0].rank, 11)
+        historic = getattr(as_of_list[0], SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, update_record.history_id)
+
+    def test_as_of_instance_matches_queryset_for_same_timestamp(self):
+        document, create_record, update_record = self._create_same_timestamp_records(
+            rank=10
+        )
+        instance = document.history.as_of(datetime.now() + timedelta(days=1))
+        self.assertEqual(instance.rank, 11)
+        historic = getattr(instance, SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, update_record.history_id)
+
+    def test_same_timestamp_delete_wins(self):
+        document = RankedDocument.objects.create(rank=10)
+        document.delete()
+        create_record, delete_record = RankedDocument.history.filter(
+            id=document.id
+        ).order_by("history_id")
+        delete_record.history_date = create_record.history_date
+        delete_record.save()
+        later = datetime.now() + timedelta(days=1)
+
+        # the deletion record is the latest one for the object
+        latest = RankedDocument.history.latest_of_each()
+        self.assertEqual(latest.count(), 1)
+        self.assertEqual(latest.get().history_type, "-")
+
+        # the queryset flavor of as_of drops the deleted object
+        self.assertEqual(list(RankedDocument.history.as_of(later)), [])
+
+        # the instance flavor of as_of follows the same rule
+        with self.assertRaises(RankedDocument.DoesNotExist):
+            document.history.as_of(later)
+
+    def test_two_objects_each_get_exactly_one_latest_record(self):
+        document1, _, update1 = self._create_same_timestamp_records(rank=10)
+        document2, _, update2 = self._create_same_timestamp_records(rank=20)
+
+        records = RankedDocument.history.latest_of_each()
+        self.assertEqual(records.count(), 2)
+        self.assertEqual(
+            {record.id for record in records}, {document1.id, document2.id}
+        )
+        self.assertEqual(
+            {record.history_id for record in records},
+            {update1.history_id, update2.history_id},
+        )
+
+        as_of_list = RankedDocument.history.as_of(datetime.now() + timedelta(days=1))
+        self.assertEqual(as_of_list.count(), 2)
+        self.assertEqual({obj.pk for obj in as_of_list}, {document1.id, document2.id})
+        self.assertEqual({obj.rank for obj in as_of_list}, {11, 21})
+
+    def test_latest_of_each_stays_lazy(self):
+        self._create_same_timestamp_records(rank=10)
+        queryset = RankedDocument.history.latest_of_each().filter(rank=11)[:1]
+        # filtering and slicing must not pull the table into Python
+        self.assertIsNone(queryset._result_cache)
+        with self.assertNumQueries(1):
+            self.assertEqual(len(list(queryset)), 1)
+
+
+class SameTimestampUUIDHistoryIdTestCase(TestCase):
+    """
+    The history primary key breaks `history_date` ties deterministically, even
+    when it is a UUID (whose ordering says nothing about commit time).
+    """
+
+    def setUp(self):
+        self.obj1 = UUIDModel.objects.create()
+        self.obj1.save()
+        self.obj2 = UUIDModel.objects.create()
+        self.obj2.save()
+        for obj in (self.obj1, self.obj2):
+            create_record = UUIDModel.history.get(id=obj.id, history_type="+")
+            update_record = UUIDModel.history.get(id=obj.id, history_type="~")
+            update_record.history_date = create_record.history_date
+            update_record.save()
+
+    def test_latest_of_each_returns_one_record_per_object(self):
+        records = UUIDModel.history.latest_of_each()
+        self.assertEqual(records.count(), 2)
+        self.assertEqual(
+            {record.id for record in records}, {self.obj1.id, self.obj2.id}
+        )
+        # the winner is deterministic: the record with the greater history UUID
+        for obj in (self.obj1, self.obj2):
+            expected = max(
+                record.history_id for record in UUIDModel.history.filter(id=obj.id)
+            )
+            self.assertEqual(records.get(id=obj.id).history_id, expected)
+
+    def test_as_of_flavors_agree_with_each_other(self):
+        later = datetime.now() + timedelta(days=1)
+        queryset_records = {
+            getattr(obj, SIMPLE_HISTORY_REVERSE_ATTR_NAME).history_id
+            for obj in UUIDModel.history.as_of(later)
+        }
+        instance_records = {
+            getattr(
+                obj.history.as_of(later), SIMPLE_HISTORY_REVERSE_ATTR_NAME
+            ).history_id
+            for obj in (self.obj1, self.obj2)
+        }
+        latest_records = {
+            record.history_id for record in UUIDModel.history.latest_of_each()
+        }
+        self.assertEqual(len(queryset_records), 2)
+        self.assertEqual(queryset_records, instance_records)
+        self.assertEqual(queryset_records, latest_records)
 
 
 class AsOfTestCase(TestCase):

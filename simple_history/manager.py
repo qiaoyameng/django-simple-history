@@ -57,15 +57,30 @@ class HistoricalQuerySet(QuerySet):
         """
         Ensures results in the queryset are the latest historical record for each
         primary key. This includes deletion records.
+
+        "Latest" is defined as a stable total ordering on ``history_date`` and the
+        historical record's primary key: records with a later ``history_date`` are
+        newer, and ties are broken deterministically by the history primary key.
+        (For non-monotonic keys such as UUIDs, the key only breaks ties; its
+        ordering says nothing about commit time.)
         """
+        history_pk_name = self.model._meta.pk.name
+
         # Subquery for finding the records that belong to the same history-tracked
         # object as the record from the outer query (identified by `_pk_attr`),
         # and that have a later `history_date` than the outer record.
+        # Records sharing the outer record's `history_date` are considered later
+        # when their history primary key is greater, so that exactly one record
+        # per history-tracked object is ever considered the latest.
         # The very latest record of a history-tracked object should be excluded from
         # this query - which will make it included in the `~Exists` query below.
         later_records = self.filter(
             Q(**{self._pk_attr: OuterRef(self._pk_attr)}),
-            Q(history_date__gt=OuterRef("history_date")),
+            Q(history_date__gt=OuterRef("history_date"))
+            | Q(
+                Q(history_date=OuterRef("history_date")),
+                Q(**{f"{history_pk_name}__gt": OuterRef(history_pk_name)}),
+            ),
         )
 
         # Filter the records to only include those for which the `later_records`
@@ -192,8 +207,11 @@ class HistoryManager(models.Manager):
             return queryset
 
         try:
-            # historical records are sorted in reverse chronological order
-            history_obj = queryset[0]
+            # Sort by the same stable total ordering used by `latest_of_each()`:
+            # `history_date` first, then the history primary key as a deterministic
+            # tiebreaker for records sharing the same `history_date`.
+            history_pk_name = self.model._meta.pk.name
+            history_obj = queryset.order_by("-history_date", f"-{history_pk_name}")[0]
         except IndexError:
             raise self.instance.DoesNotExist(
                 "%s had not yet been created." % self.instance._meta.object_name

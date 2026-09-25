@@ -6,6 +6,8 @@ Unreleased
 
 **New features:**
 
+- Added the ``clean_history_fields`` management command to replace sensitive field values (e.g. email/phone) in historical records of explicitly selected objects. It supports dry-run statistics, pre-flight field/null/relation validation, protected audit fields (``history_id``/``history_date``/``history_user``/...), batched processing with a ``--resume-after-history-id`` cursor, idempotent re-runs and a fixed ``--cutoff`` boundary so concurrent history is not chased. The live business table is never modified.
+
 
 **Breaking changes:**
 

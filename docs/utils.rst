@@ -60,3 +60,63 @@ all records older than 30 days would be removed.
 .. code-block:: bash
 
     $ python manage.py clean_old_history --days 60 --auto
+
+clean_history_fields
+--------------------
+
+Sometimes historical rows retain data that must later be removed - for
+example a user's email address or phone number left behind in old
+``HistoricalRecord`` versions. The ``clean_history_fields`` management command
+replaces selected field values in the history of explicitly selected objects
+while preserving the audit identity of every row
+(``history_id``, ``history_date``, ``history_user`` and
+``history_change_reason`` are never modified).
+
+The model, the set of business objects, the fields and the replacement values
+must all be given explicitly:
+
+.. code-block:: bash
+
+    $ python manage.py clean_history_fields contacts.contact \
+        --pks 42 \
+        --fields email phone \
+        --values email=redacted@example.com phone=0000000000 \
+        --dry-run
+
+Use ``--value`` to apply one replacement to every selected field, or
+``--null`` to scrub nullable fields with ``NULL``. Always start with
+``-d/--dry-run``: it performs every check and reports how many rows would
+change without writing anything.
+
+Before touching any row the command verifies that:
+
+- the model is historical and the fields are plain scalar model columns
+  (relations, the primary key and audit fields are rejected),
+- the replacement passes field validation (type, max length, format),
+- a ``NULL`` replacement is only used on nullable columns.
+
+Only historical rows are ever updated; the live business table is left
+untouched. Original sensitive values are never printed, even on verbose
+output.
+
+Large history sets are processed in fixed-size batches
+(``--batchsize``) inside individual transactions. Each batch reports a
+``resume-after-history-id`` cursor which can be passed to a later invocation
+with ``--resume-after-history-id`` to continue an interrupted run. Re-running
+the command is idempotent: rows that already hold the replacement value are
+skipped.
+
+A fixed boundary is captured when the run starts (override it with
+``--cutoff`` as an ISO-8601 datetime). Only rows with
+``history_date <= cutoff`` are considered, so history written concurrently
+while the command runs is never chased indefinitely. Reuse the same
+``--cutoff`` when resuming.
+
+.. code-block:: bash
+
+    $ python manage.py clean_history_fields contacts.contact \
+        --pks 42,43 \
+        --fields email \
+        --value redacted@example.com \
+        --batchsize 500 \
+        --cutoff 2026-01-01T00:00:00+00:00

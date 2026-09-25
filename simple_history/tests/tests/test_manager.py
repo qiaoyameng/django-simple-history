@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from operator import attrgetter
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import FieldError
 from django.db import IntegrityError
 from django.test import TestCase, override_settings, skipUnlessDBFeature
 
@@ -460,3 +461,198 @@ class PrefetchingMethodsTestCase(TestCase):
             self.assertEqual(len(historical_records), num_choices)
         with self.assertNumQueries(0):
             access_related_objs(historical_records)
+
+
+class DiffAsOfTestCase(TestCase):
+    def setUp(self):
+        self.pub_date = datetime(2020, 1, 1, 12, 0)
+        self.new_pub_date = datetime(2021, 6, 1, 12, 0)
+
+        # Objects existing before the diff window starts.
+        self.unchanged = Poll.objects.create(
+            question="keep", pub_date=self.pub_date
+        )
+        self.changed = Poll.objects.create(question="old", pub_date=self.pub_date)
+        self.removed = Poll.objects.create(question="gone", pub_date=self.pub_date)
+        self.recreated = Poll.objects.create(
+            question="orig", pub_date=self.pub_date
+        )
+        self.recreated_same = Poll.objects.create(
+            question="same", pub_date=self.pub_date
+        )
+        self.reverted = Poll.objects.create(question="a", pub_date=self.pub_date)
+        self.same_ts = Poll.objects.create(question="v1", pub_date=self.pub_date)
+        # Deleted before the window: should never show up in the diff.
+        Poll.objects.create(question="early", pub_date=self.pub_date).delete()
+
+        self.start = datetime.now()
+
+        # Activity inside the diff window.
+        self.changed.question = "new"
+        self.changed.pub_date = self.new_pub_date
+        self.changed.save()
+
+        self.removed_pk = self.removed.pk
+        self.removed.delete()
+
+        self.added = Poll.objects.create(question="fresh", pub_date=self.pub_date)
+
+        # Deleted and recreated under the same pk with different values.
+        recreated_pk = self.recreated.pk
+        self.recreated.delete()
+        self.recreated = Poll.objects.create(
+            pk=recreated_pk, question="rebuilt", pub_date=self.pub_date
+        )
+
+        # Deleted and recreated under the same pk with identical values.
+        recreated_same_pk = self.recreated_same.pk
+        self.recreated_same.delete()
+        self.recreated_same = Poll.objects.create(
+            pk=recreated_same_pk, question="same", pub_date=self.pub_date
+        )
+
+        # Changed and then changed back: endpoints are equal.
+        self.reverted.question = "b"
+        self.reverted.save()
+        self.reverted.question = "a"
+        self.reverted.save()
+
+        # Two versions stamped at the exact same time; the record created
+        # last (highest history id) must win.
+        self.same_ts.question = "v2"
+        self.same_ts.save()
+        self.same_ts.question = "v3"
+        self.same_ts.save()
+        v2, v3 = Poll.history.filter(id=self.same_ts.pk, history_type="~").order_by(
+            "history_id"
+        )
+        shared_ts = datetime.now()
+        v2.history_date = shared_ts
+        v2.save()
+        v3.history_date = shared_ts
+        v3.save()
+
+        self.end = datetime.now()
+
+    def history_id(self, obj, history_type):
+        return Poll.history.get(id=obj.pk, history_type=history_type).history_id
+
+    def test_diff_as_of_full_result(self):
+        diff = Poll.history.diff_as_of(self.start, self.end)
+
+        self.assertEqual([entry.pk for entry in diff.added], [self.added.pk])
+        self.assertEqual(diff.added[0].start_history_id, None)
+        self.assertEqual(
+            diff.added[0].end_history_id, self.history_id(self.added, "+")
+        )
+
+        self.assertEqual([entry.pk for entry in diff.removed], [self.removed_pk])
+        self.assertEqual(
+            diff.removed[0].start_history_id,
+            Poll.history.get(id=self.removed_pk, history_type="+").history_id,
+        )
+        self.assertEqual(diff.removed[0].end_history_id, None)
+
+        self.assertEqual(
+            [entry.pk for entry in diff.changed],
+            [self.changed.pk, self.recreated.pk, self.same_ts.pk],
+        )
+        changed_entry, recreated_entry, same_ts_entry = diff.changed
+
+        self.assertEqual(
+            changed_entry.start_history_id, self.history_id(self.changed, "+")
+        )
+        self.assertEqual(
+            changed_entry.end_history_id, self.history_id(self.changed, "~")
+        )
+        self.assertEqual(
+            set(changed_entry.changes), {"question", "pub_date"}
+        )
+        self.assertEqual(changed_entry.changes["question"].before, "old")
+        self.assertEqual(changed_entry.changes["question"].after, "new")
+        self.assertEqual(changed_entry.changes["pub_date"].before, self.pub_date)
+        self.assertEqual(
+            changed_entry.changes["pub_date"].after, self.new_pub_date
+        )
+
+        # Deleted-then-recreated objects are compared by endpoint states.
+        first_create = (
+            Poll.history.filter(id=self.recreated.pk, history_type="+")
+            .order_by("history_id")
+            .first()
+        )
+        self.assertEqual(
+            recreated_entry.start_history_id, first_create.history_id
+        )
+        self.assertEqual(recreated_entry.changes["question"].before, "orig")
+        self.assertEqual(recreated_entry.changes["question"].after, "rebuilt")
+
+        # The later of the two same-timestamp versions wins.
+        self.assertEqual(same_ts_entry.changes["question"].before, "v1")
+        self.assertEqual(same_ts_entry.changes["question"].after, "v3")
+        self.assertEqual(
+            same_ts_entry.end_history_id,
+            Poll.history.filter(id=self.same_ts.pk)
+            .order_by("history_id")
+            .last()
+            .history_id,
+        )
+
+        self.assertEqual(diff.added_total, 1)
+        self.assertEqual(diff.removed_total, 1)
+        self.assertEqual(diff.changed_total, 3)
+
+    def test_diff_as_of_uses_constant_number_of_queries(self):
+        with self.assertNumQueries(2):
+            Poll.history.diff_as_of(self.start, self.end)
+
+    def test_diff_as_of_field_selection(self):
+        diff = Poll.history.diff_as_of(self.start, self.end, fields=["question"])
+        changed_entry = diff.changed[0]
+        self.assertEqual(changed_entry.pk, self.changed.pk)
+        self.assertEqual(set(changed_entry.changes), {"question"})
+
+        diff = Poll.history.diff_as_of(self.start, self.end, fields=["pub_date"])
+        by_pk = {entry.pk: entry for entry in diff.changed}
+        # Only `changed` differs on pub_date alone.
+        self.assertEqual(set(by_pk), {self.changed.pk})
+        self.assertEqual(set(by_pk[self.changed.pk].changes), {"pub_date"})
+
+    def test_diff_as_of_unknown_field_raises(self):
+        with self.assertRaises(FieldError):
+            Poll.history.diff_as_of(self.start, self.end, fields=["nope"])
+
+    def test_diff_as_of_filters(self):
+        diff = Poll.history.diff_as_of(
+            self.start, self.end, filters={"question__in": ["keep", "old", "new"]}
+        )
+        self.assertEqual(diff.added, [])
+        self.assertEqual(diff.removed, [])
+        self.assertEqual([entry.pk for entry in diff.changed], [self.changed.pk])
+
+    def test_diff_as_of_pagination(self):
+        page1 = Poll.history.diff_as_of(self.start, self.end, page=1, page_size=2)
+        self.assertEqual(
+            [entry.pk for entry in page1.changed],
+            [self.changed.pk, self.recreated.pk],
+        )
+        self.assertEqual(page1.changed_total, 3)
+
+        page2 = Poll.history.diff_as_of(self.start, self.end, page=2, page_size=2)
+        self.assertEqual(
+            [entry.pk for entry in page2.changed], [self.same_ts.pk]
+        )
+        self.assertEqual(page2.changed_total, 3)
+
+        unpaginated = Poll.history.diff_as_of(self.start, self.end)
+        self.assertEqual(len(unpaginated.changed), 3)
+
+    def test_diff_as_of_page_requires_page_size(self):
+        with self.assertRaises(ValueError):
+            Poll.history.diff_as_of(self.start, self.end, page=1)
+
+    def test_diff_as_of_empty_window(self):
+        diff = Poll.history.diff_as_of(self.end, datetime.now())
+        self.assertEqual(diff.added, [])
+        self.assertEqual(diff.removed, [])
+        self.assertEqual(diff.changed, [])

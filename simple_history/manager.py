@@ -1,6 +1,10 @@
+from dataclasses import dataclass, field
+from typing import Any
+
 from django.conf import settings
+from django.core.exceptions import FieldError
 from django.db import models
-from django.db.models import Exists, OuterRef, Q, QuerySet
+from django.db.models import Exists, OuterRef, Q, QuerySet, Subquery
 from django.utils import timezone
 
 from simple_history.utils import (
@@ -11,6 +15,51 @@ from simple_history.utils import (
 # when converting a historical record to an instance, this attribute is added
 # to the instance so that code can reverse the instance to its historical record
 SIMPLE_HISTORY_REVERSE_ATTR_NAME = "_history"
+
+
+@dataclass
+class FieldChange:
+    """The before/after values of a single field that changed between two
+    points in time."""
+
+    before: Any
+    after: Any
+
+
+@dataclass
+class HistoryDiffEntry:
+    """A single object that was added or removed between two points in time.
+    ``start_history_id``/``end_history_id`` reference the historical record
+    representing the object's state at each endpoint; the id is ``None`` on
+    the side where the object did not exist."""
+
+    pk: Any
+    start_history_id: Any | None
+    end_history_id: Any | None
+
+
+@dataclass
+class HistoryChangeEntry(HistoryDiffEntry):
+    """A single object that exists at both points in time but whose tracked
+    field values differ. ``changes`` maps field names to ``FieldChange``."""
+
+    changes: dict[str, FieldChange] = field(default_factory=dict)
+
+
+@dataclass
+class HistoryDiff:
+    """The result of ``HistoryManager.diff_as_of()``.
+
+    The ``*_total`` attributes hold the unpaginated counts of each category,
+    while the lists themselves reflect any requested pagination.
+    """
+
+    added: list[HistoryDiffEntry] = field(default_factory=list)
+    removed: list[HistoryDiffEntry] = field(default_factory=list)
+    changed: list[HistoryChangeEntry] = field(default_factory=list)
+    added_total: int = 0
+    removed_total: int = 0
+    changed_total: int = 0
 
 
 class HistoricalQuerySet(QuerySet):
@@ -206,6 +255,150 @@ class HistoryManager(models.Manager):
         historic = getattr(result, SIMPLE_HISTORY_REVERSE_ATTR_NAME)
         setattr(historic, "_as_of", date)
         return result
+
+    def diff_as_of(
+        self, start, end, fields=None, filters=None, page=None, page_size=None
+    ):
+        """
+        Compare the data set as of two points in time and return a
+        ``HistoryDiff`` describing what changed between them, keyed by the
+        model's primary key.
+
+        Only the final state at each endpoint is considered: objects that
+        were modified in between but ended up equal are not reported, and an
+        object that was deleted and then recreated with the same primary key
+        is compared by its endpoint states.
+
+        :param start: the earlier point in time.
+        :param end: the later point in time.
+        :param fields: optional iterable of history-tracked field names (or
+            attnames) to compare; defaults to all tracked fields.
+        :param filters: optional dict of queryset filters applied to the
+            historical records of both snapshots (business filtering).
+        :param page: 1-based page number; requires ``page_size``.
+        :param page_size: maximum number of entries per category; pagination
+            is applied to each of ``added``, ``removed`` and ``changed``.
+
+        The whole diff is computed with a constant number of queries (two -
+        one per snapshot), regardless of the number of objects.
+        """
+        selected_fields = self._resolve_diff_fields(fields)
+        attnames = []
+        for tracked_field in selected_fields:
+            if tracked_field.attname not in attnames:
+                attnames.append(tracked_field.attname)
+
+        if page is not None and page_size is None:
+            raise ValueError("page_size is required when page is given.")
+        if page_size is not None:
+            page = page or 1
+            if page < 1 or page_size < 1:
+                raise ValueError("page and page_size must be positive integers.")
+
+        history_pk = self.model._meta.pk.attname
+        start_snapshot = self._snapshot_as_of(start, attnames, filters)
+        end_snapshot = self._snapshot_as_of(end, attnames, filters)
+
+        def exists(row):
+            return row is not None and row["history_type"] != "-"
+
+        added, removed, changed = [], [], []
+        for key in sorted(set(start_snapshot) | set(end_snapshot)):
+            start_row = start_snapshot.get(key)
+            end_row = end_snapshot.get(key)
+            start_exists = exists(start_row)
+            end_exists = exists(end_row)
+            if not start_exists and end_exists:
+                added.append(
+                    HistoryDiffEntry(
+                        pk=key,
+                        start_history_id=None,
+                        end_history_id=end_row[history_pk],
+                    )
+                )
+            elif start_exists and not end_exists:
+                removed.append(
+                    HistoryDiffEntry(
+                        pk=key,
+                        start_history_id=start_row[history_pk],
+                        end_history_id=None,
+                    )
+                )
+            elif start_exists and end_exists:
+                changes = {}
+                for tracked_field in selected_fields:
+                    attname = tracked_field.attname
+                    before = start_row[attname]
+                    after = end_row[attname]
+                    if before != after:
+                        changes[tracked_field.name] = FieldChange(before, after)
+                if changes:
+                    changed.append(
+                        HistoryChangeEntry(
+                            pk=key,
+                            start_history_id=start_row[history_pk],
+                            end_history_id=end_row[history_pk],
+                            changes=changes,
+                        )
+                    )
+
+        result = HistoryDiff(
+            added_total=len(added),
+            removed_total=len(removed),
+            changed_total=len(changed),
+        )
+        if page_size is not None:
+            offset = (page - 1) * page_size
+            added = added[offset : offset + page_size]
+            removed = removed[offset : offset + page_size]
+            changed = changed[offset : offset + page_size]
+        result.added = added
+        result.removed = removed
+        result.changed = changed
+        return result
+
+    def _resolve_diff_fields(self, fields):
+        tracked_fields = list(self.model.tracked_fields)
+        if fields is None:
+            return tracked_fields
+        by_name = {}
+        for tracked_field in tracked_fields:
+            by_name.setdefault(tracked_field.name, tracked_field)
+            by_name.setdefault(tracked_field.attname, tracked_field)
+        selected = []
+        for name in fields:
+            try:
+                tracked_field = by_name[name]
+            except KeyError:
+                raise FieldError(
+                    "Cannot resolve keyword '%s' into a history-tracked field. "
+                    "Choices are: %s" % (name, ", ".join(sorted(by_name)))
+                )
+            if tracked_field not in selected:
+                selected.append(tracked_field)
+        return selected
+
+    def _snapshot_as_of(self, date, attnames, filters):
+        """
+        Return a dict mapping each object primary key to the values of the
+        latest historical record for that object as of ``date`` (including
+        deletion records). Ties on ``history_date`` are broken by the
+        history primary key, so the record created last wins.
+        """
+        queryset = self.get_queryset().filter(history_date__lte=date)
+        if filters:
+            queryset = queryset.filter(**filters)
+        instance_pk = self.model.instance_type._meta.pk.attname
+        history_pk = self.model._meta.pk.attname
+        latest = (
+            queryset.filter(**{instance_pk: OuterRef(instance_pk)})
+            .order_by("-history_date", "-%s" % history_pk)
+            .values(history_pk)[:1]
+        )
+        rows = queryset.filter(
+            **{"%s__in" % history_pk: Subquery(latest)}
+        ).values(instance_pk, history_pk, "history_type", *attnames)
+        return {row[instance_pk]: row for row in rows}
 
     def bulk_history_create(
         self,

@@ -6,6 +6,10 @@ Unreleased
 
 **New features:**
 
+- Added opt-in tracking of direct changes to many-to-many through models via
+  the ``m2m_track_through`` option on ``HistoricalRecords``, plus the explicit
+  ``simple_history.utils.bulk_record_m2m_through_history`` utility for bulk
+  operations that don't emit signals
 
 **Breaking changes:**
 

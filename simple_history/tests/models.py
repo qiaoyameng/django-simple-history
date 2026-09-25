@@ -241,6 +241,34 @@ class PollWithSelfManyToMany(models.Model):
     history = HistoricalRecords(m2m_fields=[relations])
 
 
+class PollTrackedMembership(models.Model):
+    poll = models.ForeignKey("PollWithTrackedThrough", on_delete=models.CASCADE)
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+    reason = models.CharField(max_length=200, blank=True)
+
+
+class PollWithTrackedThrough(models.Model):
+    question = models.CharField(max_length=200)
+    pub_date = models.DateTimeField("date published")
+    places = models.ManyToManyField("Place", through=PollTrackedMembership)
+
+    history = HistoricalRecords(m2m_fields=[places], m2m_track_through=True)
+
+
+class PollUntrackedMembership(models.Model):
+    poll = models.ForeignKey("PollWithUntrackedThrough", on_delete=models.CASCADE)
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+    reason = models.CharField(max_length=200, blank=True)
+
+
+class PollWithUntrackedThrough(models.Model):
+    question = models.CharField(max_length=200)
+    pub_date = models.DateTimeField("date published")
+    places = models.ManyToManyField("Place", through=PollUntrackedMembership)
+
+    history = HistoricalRecords(m2m_fields=[places])
+
+
 class CustomAttrNameForeignKey(models.ForeignKey):
     def __init__(self, *args, **kwargs):
         self.attr_name = kwargs.pop("attr_name", None)

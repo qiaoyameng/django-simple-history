@@ -566,3 +566,53 @@ You will see the many to many changes when diffing between two historical record
 
     # Output:
     # categories changed from [{'poll': 1, 'category': 1}, { 'poll': 1, 'category': 2}] to [{'poll': 1, 'category': 2}]
+
+Tracking changes made directly to the through model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``m2m_changed`` signal only fires for changes made through the many-to-many
+manager (``add()``, ``remove()``, ``clear()``, ``set()``). If your code creates,
+updates or deletes instances of a custom through model directly - e.g. to set
+extra fields on the relationship - those changes are not recorded by default.
+Set ``m2m_track_through=True`` to opt in to tracking them:
+
+.. code-block:: python
+
+    class Membership(models.Model):
+        poll = models.ForeignKey("Poll", on_delete=models.CASCADE)
+        category = models.ForeignKey(Category, on_delete=models.CASCADE)
+        reason = models.CharField(max_length=200)
+
+    class Poll(models.Model):
+        question = models.CharField(max_length=200)
+        categories = models.ManyToManyField(Category, through=Membership)
+        history = HistoricalRecords(
+            m2m_fields=[categories], m2m_track_through=True
+        )
+
+Creating, updating or deleting a ``Membership`` instance then creates a new
+historical record for the affected ``Poll``, snapshotting the current state of
+the relationship (including the extra through-model fields). If a through row's
+foreign key is changed from one subject to another, both the old and the new
+subject get a historical record. Changes made through the many-to-many manager
+are still recorded only once, and history is written on the same database
+connection and within the surrounding transaction as the through-model change,
+so rolling the transaction back leaves no orphaned history.
+
+``bulk_create()``, ``bulk_update()`` and queryset ``update()`` do not emit the
+model signals this tracking relies on, so through rows changed that way are
+*not* recorded automatically. Use
+``simple_history.utils.bulk_record_m2m_through_history`` to record them
+explicitly:
+
+.. code-block:: python
+
+    >>> from simple_history.utils import bulk_record_m2m_through_history
+    >>> Membership.objects.bulk_update(memberships, ["reason"])
+    >>> bulk_record_m2m_through_history(memberships)
+
+Each affected subject gets a single new historical record, no matter how many
+of the passed through rows point to it. Subjects are looked up by the through
+rows' current foreign key values; if a bulk operation moved rows from one
+subject to another, also pass through rows representing the old state (e.g.
+fetched before the operation) so that the previous subjects are recorded too.

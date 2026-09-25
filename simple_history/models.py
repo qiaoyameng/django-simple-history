@@ -58,6 +58,10 @@ else:
 
 registered_models = {}
 
+# Maps a through model to a list of (HistoricalRecords, m2m field) tuples that
+# track direct changes to it (opted in via ``m2m_track_through``)
+tracked_through_models = {}
+
 
 def _default_get_user(request, **kwargs):
     try:
@@ -116,6 +120,7 @@ class HistoricalRecords:
         m2m_fields=(),
         m2m_fields_model_field_name="_history_m2m_fields",
         m2m_bases=(models.Model,),
+        m2m_track_through=False,
     ):
         self.user_set_verbose_name = verbose_name
         self.user_set_verbose_name_plural = verbose_name_plural
@@ -139,6 +144,7 @@ class HistoricalRecords:
         self.historical_queryset = historical_queryset
         self.m2m_fields = m2m_fields
         self.m2m_fields_model_field_name = m2m_fields_model_field_name
+        self.m2m_track_through = m2m_track_through
 
         if isinstance(no_db_index, str):
             no_db_index = [no_db_index]
@@ -230,6 +236,10 @@ class HistoricalRecords:
                 sender=field.remote_field.through,
                 weak=False,
             )
+
+        if self.m2m_track_through:
+            for field in m2m_fields:
+                self.track_through_model(field)
 
         descriptor = HistoryDescriptor(
             history_model,
@@ -660,6 +670,7 @@ class HistoricalRecords:
             self.create_historical_record(instance, created and "+" or "~", using=using)
 
     def post_delete(self, instance, using=None, **kwargs):
+        self._deleting_subjects().discard((type(instance), instance.pk))
         if not getattr(settings, "SIMPLE_HISTORY_ENABLED", True):
             return
         if self.cascade_delete_history:
@@ -677,6 +688,10 @@ class HistoricalRecords:
             return
         if not hasattr(instance._meta, "simple_history_manager_attribute"):
             return
+        # Mark the instance as being deleted (until post_delete), so that
+        # through-model signal handlers don't record extra history for
+        # through rows that are cascade-deleted along with it
+        self._deleting_subjects().add((type(instance), instance.pk))
         fields = self.fields_included(instance)
         field_attrs = {field.attname for field in fields}
         deferred_attrs = instance.get_deferred_fields()
@@ -693,6 +708,20 @@ class HistoricalRecords:
         return utils.get_change_reason_from_object(instance)
 
     def m2m_changed(self, instance, action, attr, pk_set, reverse, **_):
+        # Keep track of m2m manager operations (add/remove/clear/set) so that
+        # through-model signal handlers can tell them apart from direct
+        # through-model changes and don't record duplicate history.
+        # (The depth is maintained before the early returns below so that the
+        # pre_/post_ actions always stay balanced.)
+        if action in ("pre_add", "pre_remove", "pre_clear"):
+            self.thread.m2m_manager_operation_depth = (
+                self._m2m_manager_operation_depth() + 1
+            )
+        elif action in ("post_add", "post_remove", "post_clear"):
+            depth = self._m2m_manager_operation_depth()
+            if depth:
+                self.thread.m2m_manager_operation_depth = depth - 1
+
         if not getattr(settings, "SIMPLE_HISTORY_ENABLED", True):
             return
         if hasattr(instance, "skip_history_when_saving"):
@@ -701,6 +730,128 @@ class HistoricalRecords:
         if action in ("post_add", "post_remove", "post_clear"):
             # It should be safe to ~ this since the row must exist to modify m2m on it
             self.create_historical_record(instance, "~")
+
+    def _m2m_manager_operation_depth(self):
+        return getattr(self.thread, "m2m_manager_operation_depth", 0)
+
+    def _deleting_subjects(self):
+        try:
+            return self.thread.deleting_subjects
+        except AttributeError:
+            self.thread.deleting_subjects = set()
+            return self.thread.deleting_subjects
+
+    def track_through_model(self, field):
+        """
+        Connect signal handlers that record history when rows of the given m2m
+        field's through model are saved or deleted directly (i.e. not through
+        the m2m managers, which are covered by the ``m2m_changed`` signal).
+        """
+        through_model = field.remote_field.through
+        models.signals.pre_save.connect(
+            partial(self.through_pre_save, m2m_field=field),
+            sender=through_model,
+            weak=False,
+        )
+        models.signals.post_save.connect(
+            partial(self.through_post_save, m2m_field=field),
+            sender=through_model,
+            weak=False,
+        )
+        models.signals.post_delete.connect(
+            partial(self.through_post_delete, m2m_field=field),
+            sender=through_model,
+            weak=False,
+        )
+        tracked_through_models.setdefault(through_model, []).append((self, field))
+
+    def get_through_subject_fk_attname(self, m2m_field):
+        """
+        Return the attname of the through model's foreign key to the model the
+        given m2m field is defined on.
+        """
+        through_model = m2m_field.remote_field.through
+        fk_name = utils.get_m2m_field_name(m2m_field)
+        return through_model._meta.get_field(fk_name).attname
+
+    def _through_old_fk_attr(self, m2m_field):
+        return f"_simple_history_old_subject_fk_{m2m_field.name}"
+
+    def _through_tracking_enabled(self, instance, raw=False):
+        if not getattr(settings, "SIMPLE_HISTORY_ENABLED", True):
+            return False
+        if hasattr(instance, "skip_history_when_saving"):
+            return False
+        if raw:
+            return False
+        # Through rows saved/deleted by the m2m managers (add/remove/clear/set)
+        # are already recorded via the m2m_changed signal; don't record twice.
+        if self._m2m_manager_operation_depth() > 0:
+            return False
+        return True
+
+    def through_pre_save(self, instance, m2m_field, using=None, **kwargs):
+        # Stash the through row's current subject FK so that through_post_save
+        # can detect the row being moved to another subject
+        if not getattr(settings, "SIMPLE_HISTORY_ENABLED", True):
+            return
+        if instance.pk is None:
+            return
+        attname = self.get_through_subject_fk_attname(m2m_field)
+        old_value = (
+            type(instance)
+            ._base_manager.using(using)
+            .filter(pk=instance.pk)
+            .values_list(attname, flat=True)
+            .first()
+        )
+        setattr(instance, self._through_old_fk_attr(m2m_field), old_value)
+
+    def through_post_save(self, instance, m2m_field, using=None, **kwargs):
+        if not self._through_tracking_enabled(instance, raw=kwargs.get("raw", False)):
+            return
+        attname = self.get_through_subject_fk_attname(m2m_field)
+        subject_pks = set()
+        current_pk = getattr(instance, attname, None)
+        if current_pk is not None:
+            subject_pks.add(current_pk)
+        # If the row was moved from another subject, that subject's
+        # relationship state changed as well
+        old_pk = getattr(instance, self._through_old_fk_attr(m2m_field), None)
+        if old_pk is not None:
+            subject_pks.add(old_pk)
+        self.create_historical_records_for_through(m2m_field, subject_pks, using)
+
+    def through_post_delete(self, instance, m2m_field, using=None, **kwargs):
+        if not self._through_tracking_enabled(instance):
+            return
+        attname = self.get_through_subject_fk_attname(m2m_field)
+        subject_pk = getattr(instance, attname, None)
+        if subject_pk is not None:
+            self.create_historical_records_for_through(m2m_field, {subject_pk}, using)
+
+    def create_historical_records_for_through(self, m2m_field, subject_pks, using):
+        """
+        Create a historical record for each subject of the given m2m field
+        whose pk is in ``subject_pks``, snapshotting the current state of its
+        relationships (including any extra through-model fields).
+
+        Subjects that no longer exist are skipped - most notably subjects
+        currently being cascade-deleted, whose own delete handling records
+        their final state.
+        """
+        subject_model = m2m_field.model
+        deleting_subjects = self._deleting_subjects()
+        for pk in subject_pks:
+            if (subject_model, pk) in deleting_subjects:
+                continue
+            try:
+                subject = subject_model._base_manager.using(using).get(pk=pk)
+            except ObjectDoesNotExist:
+                continue
+            if hasattr(subject, "skip_history_when_saving"):
+                continue
+            self.create_historical_record(subject, "~", using=using)
 
     def create_historical_record_m2ms(self, history_instance, instance):
         for field in history_instance._history_m2m_fields:

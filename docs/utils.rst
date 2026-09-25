@@ -60,3 +60,23 @@ all records older than 30 days would be removed.
 .. code-block:: bash
 
     $ python manage.py clean_old_history --days 60 --auto
+
+bulk_record_m2m_through_history
+-------------------------------
+
+When ``m2m_track_through=True`` is used to track direct changes to a
+many-to-many through model (see
+:doc:`/historical_model`), bulk operations such as ``bulk_create()``,
+``bulk_update()`` and queryset ``update()`` are not recorded automatically,
+because they don't emit model signals. Call
+``simple_history.utils.bulk_record_m2m_through_history`` with the affected
+through-model instances to record the new relationship state explicitly:
+
+.. code-block:: python
+
+    >>> from simple_history.utils import bulk_record_m2m_through_history
+    >>> Membership.objects.bulk_update(memberships, ["reason"])
+    >>> bulk_record_m2m_through_history(memberships)
+
+Each affected subject gets a single new historical record, no matter how many
+of the passed through rows point to it.

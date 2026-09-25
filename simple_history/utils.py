@@ -241,3 +241,49 @@ def get_change_reason_from_object(obj):
         return getattr(obj, "_change_reason")
 
     return None
+
+
+def bulk_record_m2m_through_history(objs, using=None):
+    """
+    Create historical records for the subjects of the given through-model
+    instances of m2m fields tracked with ``m2m_track_through=True``.
+
+    Bulk operations such as ``bulk_create()``, ``bulk_update()`` and queryset
+    ``update()`` don't emit the model signals that through tracking relies on,
+    so through rows changed that way are not recorded automatically. Call this
+    function after such operations to record the new relationship state.
+
+    Each affected subject gets a single new historical record, no matter how
+    many of the passed through rows point to it. Subjects are looked up by the
+    through rows' *current* foreign key values; if a bulk operation moved rows
+    from one subject to another, also pass through rows representing the old
+    state (e.g. fetched before the operation) so that the previous subjects get
+    a historical record as well.
+
+    :param objs: List of through-model instances whose subjects should have a
+        historical record created
+    :param using: Optional database alias to read the subjects from and (when
+        ``use_base_model_db`` is enabled) write the history to
+    """
+    # Imported here to avoid a circular import
+    from simple_history.models import tracked_through_models
+
+    subjects = {}
+    for obj in objs:
+        trackers = tracked_through_models.get(type(obj))
+        if not trackers:
+            raise NotHistoricalModelError(
+                f"Cannot find tracked m2m fields for through model {type(obj)}. "
+                "Enable `m2m_track_through` on the corresponding "
+                "HistoricalRecords to track it."
+            )
+        for records, m2m_field in trackers:
+            attname = records.get_through_subject_fk_attname(m2m_field)
+            subject_pk = getattr(obj, attname, None)
+            if subject_pk is not None:
+                key = (id(records), m2m_field.name)
+                subjects.setdefault(key, (records, m2m_field, set()))[2].add(
+                    subject_pk
+                )
+    for records, m2m_field, subject_pks in subjects.values():
+        records.create_historical_records_for_through(m2m_field, subject_pks, using)

@@ -6,6 +6,11 @@ Unreleased
 
 **New features:**
 
+- Added ``HistoryManager.diff_as_of(start, end)``, which compares the states of
+  all history-tracked objects at two points in time and returns the business
+  primary keys of added, removed and changed objects (with before/after field
+  values for the latter), supporting field selection, filtering and pagination
+  with a constant number of queries.
 
 **Breaking changes:**
 

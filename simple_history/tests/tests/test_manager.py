@@ -460,3 +460,208 @@ class PrefetchingMethodsTestCase(TestCase):
             self.assertEqual(len(historical_records), num_choices)
         with self.assertNumQueries(0):
             access_related_objs(historical_records)
+
+
+class DiffAsOfTestCase(TestCase):
+    """
+    Timeline (all other history dates are placed relative to these):
+
+        t0 ---- start ---- mid ---- mid2 ---- end
+    """
+
+    t0 = datetime(2020, 1, 1)
+    start = datetime(2020, 2, 1)
+    mid = datetime(2020, 3, 1)
+    mid2 = datetime(2020, 3, 15)
+    end = datetime(2020, 4, 1)
+
+    def setUp(self):
+        # Unchanged between start and end.
+        self.unchanged = RankedDocument.objects.create(rank=10)
+        self._set_dates(self.unchanged.pk, [self.t0])
+
+        # Changed twice between the endpoints; only the final state counts.
+        self.changed = RankedDocument.objects.create(rank=1)
+        self.changed.rank = 2
+        self.changed.save()
+        self.changed.rank = 3
+        self.changed.save()
+        self._set_dates(self.changed.pk, [self.t0, self.mid, self.mid2])
+
+        # Changed and reverted between the endpoints: not a change.
+        self.reverted = RankedDocument.objects.create(rank=5)
+        self.reverted.rank = 99
+        self.reverted.save()
+        self.reverted.rank = 5
+        self.reverted.save()
+        self._set_dates(self.reverted.pk, [self.t0, self.mid, self.mid2])
+
+        # Deleted between the endpoints.
+        self.deleted = RankedDocument.objects.create(rank=8)
+        deleted_pk = self.deleted.pk
+        self.deleted.delete()
+        self.deleted_pk = deleted_pk
+        self._set_dates(deleted_pk, [self.t0, self.mid])
+
+        # Deleted and recreated with the same pk and values: not a change.
+        restored_same = RankedDocument.objects.create(rank=7)
+        self.restored_same_pk = restored_same.pk
+        restored_same.delete()
+        RankedDocument.objects.create(pk=self.restored_same_pk, rank=7)
+        self._set_dates(self.restored_same_pk, [self.t0, self.mid, self.mid2])
+
+        # Deleted and recreated with the same pk but different values:
+        # compared by endpoint states.
+        restored_diff = RankedDocument.objects.create(rank=1)
+        self.restored_diff_pk = restored_diff.pk
+        restored_diff.delete()
+        RankedDocument.objects.create(pk=self.restored_diff_pk, rank=2)
+        self._set_dates(self.restored_diff_pk, [self.t0, self.mid, self.mid2])
+
+        # Created between the endpoints.
+        self.added = RankedDocument.objects.create(rank=50)
+        self._set_dates(self.added.pk, [self.mid])
+
+        # Two versions stamped at the exact same time; the one with the
+        # highest history id is the final state.
+        self.same_ts = RankedDocument.objects.create(rank=1)
+        self.same_ts.rank = 2
+        self.same_ts.save()
+        self.same_ts.rank = 3
+        self.same_ts.save()
+        self._set_dates(self.same_ts.pk, [self.t0, self.mid, self.mid])
+
+    def _set_dates(self, pk, dates):
+        records = RankedDocument.history.filter(id=pk).order_by("history_id")
+        self.assertEqual(len(records), len(dates))
+        for record, date in zip(records, dates):
+            record.history_date = date
+            record.save()
+
+    def _history_id(self, pk, rank, history_type=None):
+        records = RankedDocument.history.filter(id=pk, rank=rank)
+        if history_type:
+            records = records.filter(history_type=history_type)
+        return records.get().history_id
+
+    def test_full_diff(self):
+        diff = RankedDocument.history.diff_as_of(self.start, self.end)
+
+        self.assertEqual([e.pk for e in diff.added], [self.added.pk])
+        self.assertEqual([e.pk for e in diff.removed], [self.deleted_pk])
+        self.assertEqual(
+            {e.pk for e in diff.changed},
+            {self.changed.pk, self.restored_diff_pk, self.same_ts.pk},
+        )
+        self.assertEqual(diff.added_count, 1)
+        self.assertEqual(diff.removed_count, 1)
+        self.assertEqual(diff.changed_count, 3)
+
+    def test_entries_reference_history_ids(self):
+        diff = RankedDocument.history.diff_as_of(self.start, self.end)
+
+        added = diff.added[0]
+        self.assertIsNone(added.start_history_id)
+        self.assertEqual(added.end_history_id, self._history_id(self.added.pk, 50))
+
+        removed = diff.removed[0]
+        self.assertEqual(
+            removed.start_history_id,
+            self._history_id(self.deleted_pk, 8, history_type="+"),
+        )
+        self.assertIsNone(removed.end_history_id)
+
+        changed = {e.pk: e for e in diff.changed}
+        entry = changed[self.changed.pk]
+        self.assertEqual(entry.start_history_id, self._history_id(self.changed.pk, 1))
+        self.assertEqual(entry.end_history_id, self._history_id(self.changed.pk, 3))
+
+    def test_changed_entries_have_field_before_after_values(self):
+        diff = RankedDocument.history.diff_as_of(self.start, self.end)
+        changed = {e.pk: e for e in diff.changed}
+
+        def rank_change(pk):
+            (change,) = changed[pk].changes
+            self.assertEqual(change.field, "rank")
+            return change
+
+        change = rank_change(self.changed.pk)
+        self.assertEqual((change.before, change.after), (1, 3))
+        change = rank_change(self.restored_diff_pk)
+        self.assertEqual((change.before, change.after), (1, 2))
+        # Same-timestamp versions: the highest history id wins.
+        change = rank_change(self.same_ts.pk)
+        self.assertEqual((change.before, change.after), (1, 3))
+
+    def test_constant_number_of_queries(self):
+        with self.assertNumQueries(2):
+            RankedDocument.history.diff_as_of(self.start, self.end)
+
+    def test_fields_selection(self):
+        diff = RankedDocument.history.diff_as_of(
+            self.start, self.end, fields=["changed_by"]
+        )
+        self.assertFalse(diff.changed)
+        self.assertEqual(diff.changed_count, 0)
+        # added/removed are unaffected by field selection
+        self.assertEqual(diff.added_count, 1)
+        self.assertEqual(diff.removed_count, 1)
+
+    def test_filters_apply_to_endpoint_states(self):
+        diff = RankedDocument.history.diff_as_of(
+            self.start, self.end, filters={"rank__gte": 3}
+        )
+        # The filter is applied independently at each endpoint: objects whose
+        # rank was below 3 at the start only exist in the end snapshot.
+        self.assertEqual(
+            {e.pk for e in diff.added},
+            {self.added.pk, self.changed.pk, self.same_ts.pk},
+        )
+        self.assertEqual([e.pk for e in diff.removed], [self.deleted_pk])
+        # restored_diff (final rank 2) is filtered out at both endpoints.
+        self.assertFalse(diff.changed)
+
+    def test_filters_matching_both_endpoints(self):
+        diff = RankedDocument.history.diff_as_of(
+            self.start, self.end, filters={"rank__gte": 1}
+        )
+        self.assertEqual([e.pk for e in diff.added], [self.added.pk])
+        self.assertEqual([e.pk for e in diff.removed], [self.deleted_pk])
+        self.assertEqual(
+            {e.pk for e in diff.changed},
+            {self.changed.pk, self.restored_diff_pk, self.same_ts.pk},
+        )
+
+    def test_pagination(self):
+        page1 = RankedDocument.history.diff_as_of(
+            self.start, self.end, page=1, page_size=2
+        )
+        self.assertEqual(len(page1.changed), 2)
+        self.assertEqual(page1.changed_count, 3)
+
+        page2 = RankedDocument.history.diff_as_of(
+            self.start, self.end, page=2, page_size=2
+        )
+        self.assertEqual(len(page2.changed), 1)
+        self.assertEqual(page2.changed_count, 3)
+
+        all_pks = {e.pk for e in page1.changed} | {e.pk for e in page2.changed}
+        self.assertEqual(
+            all_pks, {self.changed.pk, self.restored_diff_pk, self.same_ts.pk}
+        )
+
+    def test_page_requires_page_size(self):
+        with self.assertRaises(ValueError):
+            RankedDocument.history.diff_as_of(self.start, self.end, page=1)
+        with self.assertRaises(ValueError):
+            RankedDocument.history.diff_as_of(self.start, self.end, page_size=2)
+
+    def test_not_available_on_instance(self):
+        with self.assertRaises(TypeError):
+            self.unchanged.history.diff_as_of(self.start, self.end)
+
+    def test_no_changes_between_endpoints(self):
+        diff = RankedDocument.history.diff_as_of(self.t0, self.start)
+        self.assertFalse(diff.added)
+        self.assertFalse(diff.removed)
+        self.assertFalse(diff.changed)

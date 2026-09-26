@@ -137,6 +137,45 @@ When the queryset is returning historical records, `pk` refers to the
 `history_id` primary key.
 
 
+diff_as_of
+----------
+
+The ``diff_as_of`` method answers the question "what is different between the
+set of objects at these two points in time?".  Called on a model's history
+manager with a ``start`` and an ``end`` date, it returns a ``HistoryDiff``
+grouping the business primary keys of the objects that were ``added``,
+``removed`` or ``changed`` between the two points in time.
+
+.. code-block:: pycon
+
+    >>> diff = RankedDocument.history.diff_as_of(t0, t1)
+    >>> diff.added
+    (DiffEntry(pk=2, start_history_id=None, end_history_id=9, changes=()),)
+    >>> diff.changed
+    (DiffEntry(pk=1, start_history_id=3, end_history_id=7,
+               changes=(FieldChange(field='rank', before=42, after=84),)),)
+
+Only the final state at each endpoint is compared: changes that were made and
+reverted between the two dates do not show up, and an object that was deleted
+and later recreated with the same primary key is likewise compared by its
+endpoint states.  Each ``DiffEntry`` references the historical record ids at
+both endpoints; the id is ``None`` for the endpoint where the object did not
+exist.  ``changed`` entries carry a ``FieldChange`` per differing field with
+the before/after values.
+
+The comparison can be customized:
+
+- ``fields``: compare only the given fields (defaults to all tracked fields).
+- ``filters``: a dict of queryset lookups applied to the final state at each
+  endpoint, independently; an object matching only at one endpoint is
+  reported as added or removed.
+- ``page``/``page_size``: paginate each of the ``added``/``removed``/``changed``
+  categories; the ``*_count`` attributes of the result always hold the totals.
+
+The diff is computed with a constant number of queries (one per endpoint),
+regardless of how many objects are tracked.
+
+
 is_historic and to_historic
 ---------------------------
 

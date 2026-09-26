@@ -1,3 +1,6 @@
+from dataclasses import dataclass
+from typing import Any, Optional
+
 from django.conf import settings
 from django.db import models
 from django.db.models import Exists, OuterRef, Q, QuerySet
@@ -11,6 +14,55 @@ from simple_history.utils import (
 # when converting a historical record to an instance, this attribute is added
 # to the instance so that code can reverse the instance to its historical record
 SIMPLE_HISTORY_REVERSE_ATTR_NAME = "_history"
+
+
+@dataclass(frozen=True)
+class FieldChange:
+    """
+    The before/after values of a single field of an object that changed
+    between two points in time.
+    """
+
+    field: str
+    before: Any
+    after: Any
+
+
+@dataclass(frozen=True)
+class DiffEntry:
+    """
+    The diff result for a single history-tracked object, identified by the
+    primary key of the original (business) model.
+
+    ``start_history_id``/``end_history_id`` reference the historical record
+    representing the object's state at each endpoint; either is ``None`` when
+    the object did not exist at that endpoint.  ``changes`` is only populated
+    for objects present at both endpoints whose fields differ.
+    """
+
+    pk: Any
+    start_history_id: Optional[Any]
+    end_history_id: Optional[Any]
+    changes: tuple = ()
+
+
+@dataclass(frozen=True)
+class HistoryDiff:
+    """
+    The difference between the states of a model's history-tracked objects
+    at two points in time, keyed by the original model's primary key.
+
+    ``added``/``removed``/``changed`` hold the (possibly paginated) entries,
+    while ``added_count``/``removed_count``/``changed_count`` always hold the
+    total number of entries in each category.
+    """
+
+    added: tuple = ()
+    removed: tuple = ()
+    changed: tuple = ()
+    added_count: int = 0
+    removed_count: int = 0
+    changed_count: int = 0
 
 
 class HistoricalQuerySet(QuerySet):
@@ -257,6 +309,137 @@ class HistoryManager(models.Manager):
         return self.model.objects.bulk_create(
             historical_instances, batch_size=batch_size
         )
+
+    def diff_as_of(
+        self, start, end, fields=None, filters=None, page=None, page_size=None
+    ):
+        """
+        Compare the states of all history-tracked objects at two points in
+        time and return a ``HistoryDiff`` describing what changed between
+        them, keyed by the original model's primary key.
+
+        Only the final state at each endpoint is compared: changes that were
+        made and reverted between ``start`` and ``end`` do not show up, and an
+        object that was deleted and later recreated with the same primary key
+        is likewise compared by its endpoint states.  An object whose latest
+        historical record at an endpoint is a deletion is treated as absent
+        at that endpoint.
+
+        :param start: the earlier point in time.
+        :param end: the later point in time.
+        :param fields: an optional iterable of field names to compare;
+            defaults to all history-tracked fields.  Other fields are ignored,
+            so changes limited to them do not mark an object as changed.
+        :param filters: an optional dict of queryset lookup kwargs applied to
+            the final state at each endpoint (business filtering).  The filter
+            is applied independently at both endpoints, so an object matching
+            only at one endpoint is reported as added or removed.
+        :param page: 1-based page number; requires ``page_size``.  Pagination
+            is applied to each of the ``added``/``removed``/``changed``
+            categories of the returned ``HistoryDiff``.
+        :param page_size: number of entries per page; requires ``page``.
+
+        The whole diff is computed with a constant number of queries (one per
+        endpoint), regardless of the number of objects.
+        """
+        if self.instance is not None:
+            raise TypeError(
+                "Can't use diff_as_of() with a {} instance.".format(
+                    self.model._meta.object_name
+                )
+            )
+        if (page is None) != (page_size is None):
+            raise ValueError("page and page_size must be provided together.")
+
+        pk_attr = self.model.instance_type._meta.pk.attname
+        compare_fields = self._diff_compare_fields(fields)
+
+        start_states = self._states_as_of(start, pk_attr, filters)
+        end_states = self._states_as_of(end, pk_attr, filters)
+
+        added = []
+        removed = []
+        changed = []
+        for pk in sorted(set(start_states) | set(end_states)):
+            start_record = start_states.get(pk)
+            end_record = end_states.get(pk)
+            start_id = start_record.pk if start_record else None
+            end_id = end_record.pk if end_record else None
+            if start_record is None:
+                added.append(DiffEntry(pk, None, end_id))
+            elif end_record is None:
+                removed.append(DiffEntry(pk, start_id, None))
+            else:
+                changes = tuple(
+                    FieldChange(
+                        name, getattr(start_record, attr), getattr(end_record, attr)
+                    )
+                    for name, attr in compare_fields
+                    if getattr(start_record, attr) != getattr(end_record, attr)
+                )
+                if changes:
+                    changed.append(DiffEntry(pk, start_id, end_id, changes))
+
+        return HistoryDiff(
+            added=self._paginate(added, page, page_size),
+            removed=self._paginate(removed, page, page_size),
+            changed=self._paginate(changed, page, page_size),
+            added_count=len(added),
+            removed_count=len(removed),
+            changed_count=len(changed),
+        )
+
+    def _diff_compare_fields(self, fields):
+        """
+        Resolve the fields to compare into ``(reported_name, attribute)``
+        pairs, comparing foreign keys by their raw ``attname`` column so no
+        extra queries are issued.
+        """
+        tracked = {f.name: f for f in self.model.tracked_fields}
+        tracked.update({f.attname: f for f in self.model.tracked_fields})
+        if fields is None:
+            return [(f.name, f.attname) for f in self.model.tracked_fields]
+        compare_fields = []
+        for name in fields:
+            tracked_field = tracked.get(name)
+            if tracked_field is not None:
+                compare_fields.append((tracked_field.name, tracked_field.attname))
+            else:
+                compare_fields.append((name, name))
+        return compare_fields
+
+    def _states_as_of(self, date, pk_attr, filters):
+        """
+        Return a dict mapping each object's primary key to the historical
+        record representing its final state at ``date``.  Objects whose latest
+        record at ``date`` is a deletion are absent and omitted.
+        """
+        queryset = self.get_queryset().filter(history_date__lte=date)
+        queryset = queryset.latest_of_each()
+        if filters:
+            queryset = queryset.filter(**filters)
+        states = {}
+        for record in queryset:
+            pk = getattr(record, pk_attr)
+            # ``latest_of_each`` only orders by ``history_date``; when several
+            # versions share the same timestamp, the one with the highest
+            # history id is the final state.
+            current = states.get(pk)
+            if current is not None and current.pk > record.pk:
+                continue
+            states[pk] = record
+        return {
+            pk: record
+            for pk, record in states.items()
+            if record.history_type != "-"
+        }
+
+    @staticmethod
+    def _paginate(entries, page, page_size):
+        if page is None:
+            return tuple(entries)
+        offset = (page - 1) * page_size
+        return tuple(entries[offset : offset + page_size])
 
 
 class HistoryDescriptor:

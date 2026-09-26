@@ -241,6 +241,50 @@ class PollWithSelfManyToMany(models.Model):
     history = HistoricalRecords(m2m_fields=[relations])
 
 
+class PollPlaceThrough(models.Model):
+    poll = models.ForeignKey("PollWithTrackedThrough", on_delete=models.CASCADE)
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+    reason = models.CharField(max_length=200, blank=True, default="")
+
+
+class PollWithTrackedThrough(models.Model):
+    question = models.CharField(max_length=200)
+    places = models.ManyToManyField("Place", through=PollPlaceThrough)
+
+    history = HistoricalRecords(m2m_fields=[places], m2m_track_through_changes=True)
+
+
+class UntrackedPollPlaceThrough(models.Model):
+    poll = models.ForeignKey("PollWithUntrackedThrough", on_delete=models.CASCADE)
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+    reason = models.CharField(max_length=200, blank=True, default="")
+
+
+class PollWithUntrackedThrough(models.Model):
+    question = models.CharField(max_length=200)
+    places = models.ManyToManyField("Place", through=UntrackedPollPlaceThrough)
+
+    history = HistoricalRecords(m2m_fields=[places])
+
+
+class BaseModelDbThrough(models.Model):
+    tracker = models.ForeignKey(
+        "PlaceWithBaseModelDbThrough", on_delete=models.CASCADE
+    )
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+
+
+class PlaceWithBaseModelDbThrough(models.Model):
+    name = models.CharField(max_length=100)
+    places = models.ManyToManyField("Place", through=BaseModelDbThrough)
+
+    history = HistoricalRecords(
+        m2m_fields=[places],
+        m2m_track_through_changes=True,
+        use_base_model_db=True,
+    )
+
+
 class CustomAttrNameForeignKey(models.ForeignKey):
     def __init__(self, *args, **kwargs):
         self.attr_name = kwargs.pop("attr_name", None)

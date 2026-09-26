@@ -566,3 +566,54 @@ You will see the many to many changes when diffing between two historical record
 
     # Output:
     # categories changed from [{'poll': 1, 'category': 1}, { 'poll': 1, 'category': 2}] to [{'poll': 1, 'category': 2}]
+
+Tracking direct changes to the through model
+--------------------------------------------
+``m2m_changed`` only fires when the relationship is modified through the
+related manager (``add()``, ``remove()``, ``clear()``, ``set()``). If your
+``ManyToManyField`` uses a custom ``through`` model and your code saves,
+updates or deletes through model instances directly (e.g. to change extra
+columns on the relationship), no history is recorded by default.
+
+Opt in to tracking those direct through model changes with
+``m2m_track_through_changes``:
+
+.. code-block:: python
+
+    class PollMembership(models.Model):
+        poll = models.ForeignKey("Poll", on_delete=models.CASCADE)
+        category = models.ForeignKey(Category, on_delete=models.CASCADE)
+        reason = models.CharField(max_length=200, blank=True, default="")
+
+    class Poll(models.Model):
+        question = models.CharField(max_length=200)
+        categories = models.ManyToManyField(Category, through=PollMembership)
+        history = HistoricalRecords(
+            m2m_fields=[categories],
+            m2m_track_through_changes=True,
+        )
+
+With this enabled, creating, updating or deleting a ``PollMembership`` row
+directly records a new historical record (with the current relationship
+state, including the extra through fields) for every affected ``Poll``. If a
+through row's foreign key is moved from one instance to another, history is
+recorded on both sides. Changes made through the related manager are still
+recorded exactly once, and the tracked model's database alias and any
+surrounding transaction are respected - rolling the transaction back also
+rolls back the recorded history.
+
+Note that bulk operations that bypass model signals - ``bulk_update()``,
+``bulk_create()`` and queryset ``update()`` on the through model - do *not*
+trigger this tracking. Use ``simple_history.utils.bulk_record_through_changes``
+to record those changes explicitly:
+
+.. code-block:: python
+
+    from simple_history.utils import bulk_record_through_changes
+
+    memberships = list(PollMembership.objects.filter(reason="outdated"))
+    for membership in memberships:
+        membership.reason = "reviewed"
+    PollMembership.objects.bulk_update(memberships, fields=["reason"])
+    # bulk_update() doesn't emit signals, so record the changes explicitly
+    bulk_record_through_changes(memberships)

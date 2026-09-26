@@ -12,7 +12,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
 from django.core.files.base import ContentFile
-from django.db import IntegrityError, models
+from django.db import IntegrityError, models, transaction
 from django.db.models import Prefetch
 from django.db.models.fields.proxy import OrderWrt
 from django.test import TestCase, override_settings
@@ -20,7 +20,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from simple_history import register
-from simple_history.exceptions import RelatedNameConflictError
+from simple_history.exceptions import NotHistoricalModelError, RelatedNameConflictError
 from simple_history.models import (
     SIMPLE_HISTORY_REVERSE_ATTR_NAME,
     DeletedObject,
@@ -34,7 +34,11 @@ from simple_history.signals import (
     pre_create_historical_m2m_records,
     pre_create_historical_record,
 )
-from simple_history.utils import get_history_model_for_model, update_change_reason
+from simple_history.utils import (
+    bulk_record_through_changes,
+    get_history_model_for_model,
+    update_change_reason,
+)
 
 from ..external.models import (
     ExternalModel,
@@ -44,6 +48,7 @@ from ..external.models import (
 from ..models import (
     AbstractBase,
     AdminProfile,
+    BaseModelDbThrough,
     BasePlace,
     BaseTestOrganization,
     BaseTestParticipantToOrganization,
@@ -91,10 +96,12 @@ from ..models import (
     OverrideModelNameUsingBaseModel1,
     Person,
     Place,
+    PlaceWithBaseModelDbThrough,
     Poll,
     PollChildBookWithManyToMany,
     PollChildRestaurantWithManyToMany,
     PollInfo,
+    PollPlaceThrough,
     PollWithAlternativeManager,
     PollWithExcludedFieldsWithDefaults,
     PollWithExcludedFKField,
@@ -107,6 +114,8 @@ from ..models import (
     PollWithQuerySetCustomizations,
     PollWithSelfManyToMany,
     PollWithSeveralManyToMany,
+    PollWithTrackedThrough,
+    PollWithUntrackedThrough,
     Province,
     Restaurant,
     SelfFK,
@@ -126,6 +135,7 @@ from ..models import (
     TestParticipantToHistoricOrganizationOneToOne,
     UnicodeVerboseName,
     UnicodeVerboseNamePlural,
+    UntrackedPollPlaceThrough,
     UserTextFieldChangeReasonModel,
     UUIDDefaultModel,
     UUIDModel,
@@ -2538,6 +2548,186 @@ class ManyToManyTest(TestCase):
             [expected_change], ["places"], add_record, del_record
         )
         self.assertEqual(delta, expected_delta)
+
+
+class ManyToManyTrackedThroughTest(TestCase):
+    def setUp(self):
+        self.model = PollWithTrackedThrough
+        self.through_model = PollPlaceThrough
+        self.place = Place.objects.create(name="Home")
+        self.other_place = Place.objects.create(name="Away")
+        self.poll = PollWithTrackedThrough.objects.create(question="what's up?")
+
+    def test_through_create_records_history(self):
+        # Only the poll's create record exists so far
+        self.assertEqual(self.poll.history.count(), 1)
+
+        self.through_model.objects.create(
+            poll=self.poll, place=self.place, reason="manual"
+        )
+
+        self.assertEqual(self.poll.history.count(), 2)
+        record = self.poll.history.first()
+        self.assertEqual(record.history_type, "~")
+        through_record = record.places.get()
+        self.assertEqual(through_record.place, self.place)
+        self.assertEqual(through_record.reason, "manual")
+
+    def test_through_update_records_history(self):
+        through = self.through_model.objects.create(
+            poll=self.poll, place=self.place, reason="old"
+        )
+        self.assertEqual(self.poll.history.count(), 2)
+
+        through.reason = "new"
+        through.save()
+
+        self.assertEqual(self.poll.history.count(), 3)
+        record = self.poll.history.first()
+        self.assertEqual(record.history_type, "~")
+        self.assertEqual(record.places.get().reason, "new")
+
+    def test_through_delete_records_history(self):
+        through = self.through_model.objects.create(
+            poll=self.poll, place=self.place
+        )
+        self.assertEqual(self.poll.history.count(), 2)
+
+        through.delete()
+
+        self.assertEqual(self.poll.history.count(), 3)
+        record = self.poll.history.first()
+        self.assertEqual(record.history_type, "~")
+        self.assertEqual(record.places.count(), 0)
+
+    def test_through_fk_change_records_history_on_both_sides(self):
+        other_poll = PollWithTrackedThrough.objects.create(question="other?")
+        through = self.through_model.objects.create(
+            poll=self.poll, place=self.place
+        )
+        self.assertEqual(self.poll.history.count(), 2)
+        self.assertEqual(other_poll.history.count(), 1)
+
+        # Move the through row from one poll to the other
+        through.poll = other_poll
+        through.save()
+
+        self.assertEqual(self.poll.history.count(), 3)
+        self.assertEqual(self.poll.history.first().places.count(), 0)
+        self.assertEqual(other_poll.history.count(), 2)
+        self.assertEqual(other_poll.history.first().places.count(), 1)
+        self.assertEqual(other_poll.history.first().places.get().place, self.place)
+
+    def test_add_remove_clear_are_not_recorded_twice(self):
+        self.poll.places.add(self.place)
+        self.assertEqual(self.poll.history.count(), 2)
+        self.assertEqual(self.poll.history.first().places.count(), 1)
+
+        self.poll.places.remove(self.place)
+        self.assertEqual(self.poll.history.count(), 3)
+        self.assertEqual(self.poll.history.first().places.count(), 0)
+
+        self.poll.places.add(self.place, self.other_place)
+        self.assertEqual(self.poll.history.count(), 4)
+        self.assertEqual(self.poll.history.first().places.count(), 2)
+
+        self.poll.places.clear()
+        self.assertEqual(self.poll.history.count(), 5)
+        self.assertEqual(self.poll.history.first().places.count(), 0)
+
+    def test_poll_delete_does_not_record_extra_through_history(self):
+        self.through_model.objects.create(poll=self.poll, place=self.place)
+        self.assertEqual(self.poll.history.count(), 2)
+
+        poll_pk = self.poll.pk
+        self.poll.delete()
+
+        history = PollWithTrackedThrough.history.filter(id=poll_pk)
+        self.assertEqual(
+            list(
+                history.order_by("history_date").values_list(
+                    "history_type", flat=True
+                )
+            ),
+            ["+", "~", "-"],
+        )
+
+    def test_through_changes_not_tracked_without_opt_in(self):
+        poll = PollWithUntrackedThrough.objects.create(question="what's up?")
+        self.assertEqual(poll.history.count(), 1)
+
+        UntrackedPollPlaceThrough.objects.create(poll=poll, place=self.place)
+        self.assertEqual(poll.history.count(), 1)
+
+    def test_bulk_update_does_not_record_history_automatically(self):
+        through = self.through_model.objects.create(
+            poll=self.poll, place=self.place, reason="old"
+        )
+        self.assertEqual(self.poll.history.count(), 2)
+
+        through.reason = "bulk"
+        self.through_model.objects.bulk_update([through], fields=["reason"])
+
+        # bulk_update() doesn't emit signals, so nothing is recorded yet
+        self.assertEqual(self.poll.history.count(), 2)
+
+        through.refresh_from_db()
+        bulk_record_through_changes([through])
+
+        self.assertEqual(self.poll.history.count(), 3)
+        self.assertEqual(self.poll.history.first().places.get().reason, "bulk")
+
+    def test_bulk_record_through_changes_with_untracked_through_raises(self):
+        poll = PollWithUntrackedThrough.objects.create(question="what's up?")
+        through = UntrackedPollPlaceThrough.objects.create(
+            poll=poll, place=self.place
+        )
+        with self.assertRaises(NotHistoricalModelError):
+            bulk_record_through_changes([through])
+
+    def test_transaction_rollback_leaves_no_history(self):
+        self.assertEqual(self.poll.history.count(), 1)
+
+        class Rollback(Exception):
+            pass
+
+        with self.assertRaises(Rollback):
+            with transaction.atomic():
+                self.through_model.objects.create(
+                    poll=self.poll, place=self.place
+                )
+                self.assertEqual(self.poll.history.count(), 2)
+                raise Rollback
+
+        self.assertEqual(self.through_model.objects.count(), 0)
+        self.assertEqual(self.poll.history.count(), 1)
+
+    @override_settings(SIMPLE_HISTORY_ENABLED=False)
+    def test_through_changes_not_recorded_when_history_disabled(self):
+        # 1 record from `setUp()` (created before the override took effect)
+        self.assertEqual(self.poll.history.count(), 1)
+
+        self.through_model.objects.create(poll=self.poll, place=self.place)
+        self.assertEqual(self.poll.history.count(), 1)
+
+
+class ManyToManyTrackedThroughMultiDBTest(TestCase):
+    databases = {"default", "other"}
+
+    def test_through_change_uses_base_model_db(self):
+        tracker = PlaceWithBaseModelDbThrough.objects.using("other").create(name="t")
+        place = Place.objects.using("other").create(name="Home")
+
+        BaseModelDbThrough(tracker=tracker, place=place).save(using="other")
+
+        # History (including the m2m snapshot) is written to the "other" database
+        self.assertEqual(tracker.history.using("other").count(), 2)
+        self.assertEqual(
+            PlaceWithBaseModelDbThrough.history.using("default").count(), 0
+        )
+        record = tracker.history.using("other").first()
+        self.assertEqual(record.places.using("other").count(), 1)
+        self.assertEqual(record.places.using("default").count(), 0)
 
 
 @override_settings(**database_router_override_settings)

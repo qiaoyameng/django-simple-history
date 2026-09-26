@@ -241,3 +241,36 @@ def get_change_reason_from_object(obj):
         return getattr(obj, "_change_reason")
 
     return None
+
+
+def bulk_record_through_changes(through_instances, using=None):
+    """
+    Explicitly record history for direct changes to tracked through models that
+    bypass model signals - e.g. ``bulk_update()``, ``bulk_create()`` or
+    queryset ``update()`` on the through model, which don't emit ``post_save``/
+    ``post_delete`` and therefore aren't picked up by
+    ``HistoricalRecords(m2m_track_through_changes=True)``.
+
+    :param through_instances: Iterable of through model instances reflecting
+        the *new* state of the rows. A new historical record (with the current
+        m2m state) is created for every tracked instance they reference. Only
+        through models of fields registered with
+        ``m2m_track_through_changes=True`` are handled.
+    :param using: Optional database alias to read tracked instances from and
+        write history to.
+    """
+    # Imported here to avoid a circular import
+    from simple_history.models import HistoricalRecords
+
+    instances_by_through = {}
+    for instance in through_instances:
+        instances_by_through.setdefault(type(instance), []).append(instance)
+    for through_model, instances in instances_by_through.items():
+        registrations = HistoricalRecords.through_models.get(through_model)
+        if not registrations:
+            raise NotHistoricalModelError(
+                f"Cannot find a tracked many-to-many field with through model "
+                f"{through_model}. Make sure the field is registered with "
+                f"HistoricalRecords(m2m_track_through_changes=True)."
+            )
+        registrations[0][0].record_through_changes(instances, using=using)

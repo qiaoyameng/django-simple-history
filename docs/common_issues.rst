@@ -163,12 +163,15 @@ Tracking Custom Users
 
 Using F() expressions
 ---------------------
-``F()`` expressions, as described here_, do not work on models that have
-history. Simple history inserts a new record in the historical table for any
-model being updated. However, ``F()`` expressions are only functional on updates.
-Thus, when an ``F()`` expression is used on a model with a history table, the
-historical model tries to insert using the ``F()`` expression, and raises a
-``ValueError``.
+``F()`` expressions, as described here_, work on models that have history.
+After the model is saved, simple history reads the database-computed value
+back (on the same database connection the instance was saved to), so the
+historical record stores the computed value instead of the unevaluated
+``F()`` expression. The same applies to other database-computed values such
+as ``GeneratedField`` and ``db_default``: the historical record stores the
+plain value as computed by the database at the time of the change, and a
+``GeneratedField`` is represented on the history model as a plain field of
+its output type.
 
 .. _here: https://docs.djangoproject.com/en/stable/ref/models/expressions/#f-expressions
 

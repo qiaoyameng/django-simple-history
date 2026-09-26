@@ -6,6 +6,12 @@ Unreleased
 
 **New features:**
 
+- Added support for database-computed field values: expression assignments
+  (e.g. ``F()``), ``GeneratedField`` and ``db_default`` values are now read
+  back from the database after save (in a single query, on the same database
+  connection) so historical records store the computed values instead of
+  unevaluated expressions. ``GeneratedField`` becomes a plain field of its
+  output type on the history model, preserving the value as it was.
 
 **Breaking changes:**
 

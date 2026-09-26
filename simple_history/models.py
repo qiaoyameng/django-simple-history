@@ -12,8 +12,9 @@ from django.conf import settings
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured, ObjectDoesNotExist
-from django.db import models
+from django.db import DEFAULT_DB_ALIAS, connections, models
 from django.db.models import ManyToManyField
+from django.db.models.expressions import BaseExpression
 from django.db.models.fields.proxy import OrderWrt
 from django.db.models.fields.related import ForeignKey
 from django.db.models.fields.related_descriptors import (
@@ -397,6 +398,12 @@ class HistoricalRecords:
                 field = FieldType(*args, **field_args)
                 field.name = old_field.name
             else:
+                if isinstance(field, models.GeneratedField):
+                    # Generated fields must store the plain value computed at
+                    # the time of the change, not have the database recompute
+                    # the (possibly since changed) expression on the history
+                    # table.
+                    field = convert_generated_field(field)
                 transform_field(field)
 
             # drop db index
@@ -657,7 +664,42 @@ class HistoricalRecords:
             return
 
         if not kwargs.get("raw", False):
+            self.refresh_db_computed_fields(instance, created, using=using)
             self.create_historical_record(instance, created and "+" or "~", using=using)
+
+    def refresh_db_computed_fields(self, instance, created, using=None):
+        """
+        Refresh fields whose values are computed by the database on save
+        (``GeneratedField``, ``db_default`` and expression assignments such as
+        ``F()``), as well as any deferred fields, so that the historical record
+        captures the values the database actually stored instead of e.g.
+        inserting an unevaluated ``F`` object.
+
+        Everything is refreshed with a single query, on the same database
+        connection (and therefore the same transaction) as the save itself,
+        so the values read back are the ones written by this save.
+        """
+        fields = self.fields_included(instance)
+        field_attrs = {field.attname for field in fields}
+        deferred_attrs = instance.get_deferred_fields()
+        # Load all deferred fields that are present in fields_included in one
+        # go, instead of triggering one query per field when they are accessed.
+        fields_to_refresh = field_attrs.intersection(deferred_attrs)
+        # On insert, Django already fetched generated values via RETURNING
+        # when the backend supports it.
+        insert_returning = created and connections[
+            using or DEFAULT_DB_ALIAS
+        ].features.can_return_columns_from_insert
+        for field in fields:
+            if field.generated:
+                if not insert_returning:
+                    fields_to_refresh.add(field.attname)
+            elif isinstance(instance.__dict__.get(field.attname), BaseExpression):
+                # e.g. obj.count = F("count") + 1: after saving, the instance
+                # still holds the expression object, not the computed value.
+                fields_to_refresh.add(field.attname)
+        if fields_to_refresh:
+            instance.refresh_from_db(using=using, fields=fields_to_refresh)
 
     def post_delete(self, instance, using=None, **kwargs):
         if not getattr(settings, "SIMPLE_HISTORY_ENABLED", True):
@@ -812,6 +854,22 @@ class HistoricalRecords:
             field if isinstance(field, str) else field.name for field in m2m_fields
         ]
         return [getattr(model, field_name).field for field_name in field_names]
+
+
+def convert_generated_field(field):
+    """
+    Convert a GeneratedField into a plain field of its output type, so that
+    historical records store the value as it was when the change happened,
+    instead of the database recomputing the expression on the history table.
+    """
+    output_field = copy.copy(field.output_field)
+    output_field.name = field.name
+    output_field.attname = field.attname
+    output_field.db_column = field.db_column
+    output_field.db_index = field.db_index
+    output_field.null = True
+    output_field.blank = True
+    return output_field
 
 
 def transform_field(field):

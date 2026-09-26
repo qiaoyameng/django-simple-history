@@ -80,6 +80,7 @@ from ..models import (
     Library,
     ManyToManyModelOther,
     ModelWithCustomAttrOneToOneField,
+    ModelWithDbComputedValues,
     ModelWithExcludedManyToMany,
     ModelWithFkToModelWithHistoryUsingBaseModelDb,
     ModelWithHistoryInDifferentDb,
@@ -1864,6 +1865,100 @@ class WarningOnAbstractModelWithInheritFalseTest(TestCase):
                 "(AbstractModelWithInheritFalse) without "
                 "inherit=True",
             )
+
+
+class DbComputedValuesTest(TestCase):
+    """
+    Asserts that values computed by the database on save (expression
+    assignments like ``F()``, ``GeneratedField``, ``db_default``) are captured
+    as plain values in the historical record.
+    """
+
+    def test_generated_field_is_plain_field_on_history_model(self):
+        history_model = ModelWithDbComputedValues.history.model
+        field = history_model._meta.get_field("doubled_count")
+        self.assertFalse(field.generated)
+        self.assertIsInstance(field, models.IntegerField)
+
+    def test_expression_assignment_and_generated_field(self):
+        obj = ModelWithDbComputedValues.objects.create(name="counter", count=1)
+        obj.count = models.F("count") + 1
+        obj.save()
+        obj.count = models.F("count") + 1
+        obj.save()
+
+        # The instance itself is refreshed with the computed values
+        self.assertEqual(obj.count, 3)
+        self.assertEqual(obj.doubled_count, 6)
+
+        records = list(obj.history.order_by("history_date", "history_id"))
+        self.assertEqual([r.history_type for r in records], ["+", "~", "~"])
+        self.assertEqual([r.count for r in records], [1, 2, 3])
+        self.assertEqual([r.doubled_count for r in records], [2, 4, 6])
+        for record in records:
+            self.assertIsInstance(record.count, int)
+            self.assertIsInstance(record.doubled_count, int)
+
+    def test_expression_assignment_with_update_fields(self):
+        obj = ModelWithDbComputedValues.objects.create(name="counter", count=1)
+        obj.count = models.F("count") + 1
+        obj.save(update_fields=["count"])
+
+        record = obj.history.order_by("-history_date", "-history_id").first()
+        self.assertEqual(record.count, 2)
+        # The generated column depending on the updated field is captured too
+        self.assertEqual(record.doubled_count, 4)
+
+    def test_db_default_value(self):
+        obj = ModelWithDbComputedValues.objects.create(name="counter", count=1)
+        record = obj.history.order_by("-history_date", "-history_id").first()
+        self.assertEqual(record.kind, "standard")
+
+    def test_deferred_fields_refreshed_in_single_query(self):
+        obj = ModelWithDbComputedValues.objects.create(
+            name="counter", description="desc", count=1
+        )
+        deferred_obj = ModelWithDbComputedValues.objects.defer(
+            "name", "description"
+        ).get(pk=obj.pk)
+        deferred_obj.count = models.F("count") + 1
+        # 1 UPDATE + 1 SELECT refreshing all deferred/computed fields at once
+        # + 1 INSERT for the historical record
+        with self.assertNumQueries(3):
+            deferred_obj.save()
+
+        record = deferred_obj.history.order_by("-history_date", "-history_id").first()
+        self.assertEqual(record.name, "counter")
+        self.assertEqual(record.description, "desc")
+        self.assertEqual(record.count, 2)
+        self.assertEqual(record.doubled_count, 4)
+
+
+class DbComputedValuesMultiDBTest(TestCase):
+    """
+    Asserts database-computed values are read back from the same database
+    the instance was saved to.
+    """
+
+    databases = {"default", "other"}
+
+    def test_save_using_other_database(self):
+        obj = ModelWithDbComputedValues(name="counter", count=1)
+        obj.save(using="other")
+        obj.count = models.F("count") + 1
+        obj.save(using="other")
+
+        self.assertEqual(obj.count, 2)
+        self.assertEqual(obj.doubled_count, 4)
+        # History is stored on the default database (use_base_model_db=False),
+        # but the computed values must have been read from "other".
+        record = (
+            ModelWithDbComputedValues.history.using("default")
+            .order_by("-history_date", "-history_id")
+            .first()
+        )
+        self.assertEqual(record.count, 2)
+        self.assertEqual(record.doubled_count, 4)
 
 
 class MultiDBWithUsingTest(TestCase):

@@ -1082,3 +1082,17 @@ class TestHistoricParticipantToHistoricOrganizationOneToOne(
         related_name="historic_participant",
     )
     history = HistoricalRecords()
+
+
+class ModelWithDbComputedValues(models.Model):
+    name = models.CharField(max_length=100)
+    description = models.CharField(max_length=100, blank=True, default="")
+    count = models.IntegerField(default=0)
+    kind = models.CharField(max_length=20, db_default="standard")
+    doubled_count = models.GeneratedField(
+        expression=models.F("count") * 2,
+        output_field=models.IntegerField(),
+        db_persist=True,
+    )
+
+    history = HistoricalRecords()

@@ -1,13 +1,15 @@
+import uuid
 from datetime import datetime, timedelta
 from operator import attrgetter
 
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError
 from django.test import TestCase, override_settings, skipUnlessDBFeature
+from django.utils import timezone
 
 from simple_history.manager import SIMPLE_HISTORY_REVERSE_ATTR_NAME
 
-from ..models import Choice, Document, Poll, RankedDocument
+from ..models import Choice, Document, Poll, RankedDocument, UUIDModel
 from .utils import HistoricalTestCase
 
 User = get_user_model()
@@ -65,6 +67,130 @@ class LatestOfEachTestCase(HistoricalTestCase):
                 "history_type": "+",
             },
         )
+
+
+class SameTimestampLatestOfEachTestCase(TestCase):
+    """
+    `latest_of_each()` and `as_of()` break `history_date` ties deterministically
+    using the historical record's primary key, so that exactly one record per
+    history-tracked object is considered the latest.
+    """
+
+    def test_same_timestamp_updates(self):
+        document = RankedDocument.objects.create(rank=10)
+        document.rank = 20
+        document.save()
+        same_time = timezone.now()
+        create_record = RankedDocument.history.get(history_type="+")
+        update_record = RankedDocument.history.get(history_type="~")
+        create_record.history_date = same_time
+        create_record.save()
+        update_record.history_date = same_time
+        update_record.save()
+
+        # The update record has the larger `history_id` and thus wins the tie;
+        # the create record must not also be returned.
+        latest = RankedDocument.history.latest_of_each()
+        self.assertEqual(list(latest), [update_record])
+        # Filtering and pagination stay lazy and happen in the database.
+        self.assertEqual(list(latest.filter(rank=20)), [update_record])
+        self.assertEqual(list(latest.filter(rank=10)), [])
+        self.assertEqual(list(RankedDocument.history.latest_of_each()[:1]), [update_record])
+
+        # The queryset-level `as_of()` returns the object exactly once,
+        # reflecting the update.
+        as_of_list = list(RankedDocument.history.as_of(same_time))
+        self.assertEqual(len(as_of_list), 1)
+        self.assertEqual(as_of_list[0].rank, 20)
+        historic = getattr(as_of_list[0], SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, update_record.history_id)
+
+        # The instance-level `as_of()` follows the same rule.
+        instance = document.history.as_of(same_time)
+        self.assertEqual(instance.rank, 20)
+        historic = getattr(instance, SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, update_record.history_id)
+
+    def test_same_timestamp_delete(self):
+        document = RankedDocument.objects.create(rank=10)
+        document.rank = 20
+        document.save()
+        RankedDocument.objects.filter(pk=document.pk).delete()
+        same_time = timezone.now()
+        for record in RankedDocument.history.all():
+            record.history_date = same_time
+            record.save()
+        delete_record = RankedDocument.history.get(history_type="-")
+
+        # The delete record has the largest `history_id` and thus wins the tie.
+        self.assertEqual(
+            list(RankedDocument.history.latest_of_each()), [delete_record]
+        )
+        # The object must not be returned as of the shared timestamp...
+        self.assertEqual(list(RankedDocument.history.as_of(same_time)), [])
+        # ...neither by the queryset-level nor the instance-level `as_of()`.
+        with self.assertRaises(RankedDocument.DoesNotExist):
+            document.history.as_of(same_time)
+
+    def test_same_timestamp_with_multiple_objects(self):
+        document1 = RankedDocument.objects.create(rank=10)
+        document1.rank = 11
+        document1.save()
+        document2 = RankedDocument.objects.create(rank=20)
+        document2.rank = 21
+        document2.save()
+        same_time = timezone.now()
+        for record in RankedDocument.history.all():
+            record.history_date = same_time
+            record.save()
+
+        # Exactly one record per object survives the tie-break.
+        latest = RankedDocument.history.latest_of_each()
+        self.assertEqual(latest.count(), 2)
+        self.assertEqual({record.rank for record in latest}, {11, 21})
+        as_of_list = list(RankedDocument.history.as_of(same_time))
+        self.assertEqual({obj.rank for obj in as_of_list}, {11, 21})
+
+
+class SameTimestampUUIDHistoryIdTestCase(TestCase):
+    """
+    The `history_date` tie-break also works with a custom UUID `history_id`.
+    The UUID only provides a deterministic ordering; it does not imply
+    anything about commit order.
+    """
+
+    def test_same_timestamp_with_uuid_history_id(self):
+        obj = UUIDModel.objects.create()
+        UUIDModel.history.all().delete()
+        same_time = timezone.now()
+        smaller_uuid = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        larger_uuid = uuid.UUID("00000000-0000-0000-0000-000000000002")
+        # The record created first gets the larger UUID: the tie-break is
+        # deterministic on `history_id`, not on commit order.
+        winning_record = UUIDModel.history.create(
+            id=obj.pk,
+            history_date=same_time,
+            history_type="~",
+            history_id=larger_uuid,
+        )
+        UUIDModel.history.create(
+            id=obj.pk,
+            history_date=same_time,
+            history_type="~",
+            history_id=smaller_uuid,
+        )
+
+        self.assertEqual(
+            list(UUIDModel.history.latest_of_each()), [winning_record]
+        )
+
+        as_of_obj = UUIDModel.history.as_of(same_time).get()
+        historic = getattr(as_of_obj, SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, larger_uuid)
+
+        instance = obj.history.as_of(same_time)
+        historic = getattr(instance, SIMPLE_HISTORY_REVERSE_ATTR_NAME)
+        self.assertEqual(historic.history_id, larger_uuid)
 
 
 class AsOfTestCase(TestCase):

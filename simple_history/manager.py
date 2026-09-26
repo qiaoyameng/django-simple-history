@@ -57,15 +57,27 @@ class HistoricalQuerySet(QuerySet):
         """
         Ensures results in the queryset are the latest historical record for each
         primary key. This includes deletion records.
+
+        The "latest" record is determined by a stable total ordering on
+        ``(history_date, history_id)``: a record is newer when its
+        ``history_date`` is greater, and ties on ``history_date`` are broken
+        deterministically by the historical record's primary key. (For UUID
+        history ids, the tie-break only guarantees a deterministic result;
+        it does not imply anything about commit order.)
         """
         # Subquery for finding the records that belong to the same history-tracked
         # object as the record from the outer query (identified by `_pk_attr`),
-        # and that have a later `history_date` than the outer record.
+        # and that are newer than the outer record according to the
+        # `(history_date, history_id)` ordering.
         # The very latest record of a history-tracked object should be excluded from
         # this query - which will make it included in the `~Exists` query below.
         later_records = self.filter(
             Q(**{self._pk_attr: OuterRef(self._pk_attr)}),
-            Q(history_date__gt=OuterRef("history_date")),
+            Q(history_date__gt=OuterRef("history_date"))
+            | Q(
+                history_date=OuterRef("history_date"),
+                history_id__gt=OuterRef("history_id"),
+            ),
         )
 
         # Filter the records to only include those for which the `later_records`
@@ -192,8 +204,10 @@ class HistoryManager(models.Manager):
             return queryset
 
         try:
-            # historical records are sorted in reverse chronological order
-            history_obj = queryset[0]
+            # Order by the same stable total ordering used by `latest_of_each()`:
+            # reverse chronological, with ties on `history_date` broken
+            # deterministically by the historical record's primary key.
+            history_obj = queryset.order_by("-history_date", "-history_id")[0]
         except IndexError:
             raise self.instance.DoesNotExist(
                 "%s had not yet been created." % self.instance._meta.object_name

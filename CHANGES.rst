@@ -12,6 +12,12 @@ Unreleased
 
 **Bug fixes:**
 
+- Fixed ``latest_of_each()`` and ``as_of()`` returning duplicate or stale
+  objects when multiple historical records of the same object share an
+  identical ``history_date``; the "latest" record is now determined by a
+  stable total ordering on ``(history_date, history_id)``, with the
+  historical record's primary key (integer or UUID) deterministically
+  breaking ties
 
 **Other changes:**
 

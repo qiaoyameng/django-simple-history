@@ -6,6 +6,12 @@ Unreleased
 
 **New features:**
 
+- Added ``simple_history.restore`` with ``plan_bulk_restore()``/``bulk_restore()``:
+  a two-step bulk restore interface that builds a checkable restore plan from a
+  list of history ids (listing creates, updates, relation replacements and
+  blockers) and applies it atomically, restoring M2M and custom through fields
+  and writing new history records that reference the source history ids
+
 
 **Breaking changes:**
 

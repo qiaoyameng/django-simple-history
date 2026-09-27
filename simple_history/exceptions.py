@@ -25,3 +25,15 @@ class AlternativeManagerError(Exception):
     """Manager does not belong to model"""
 
     pass
+
+
+class RestoreBlockedError(Exception):
+    """A restore plan has blockers and cannot be applied."""
+
+    pass
+
+
+class RestoreConflictError(Exception):
+    """Current state has drifted from the state the restore plan was built on."""
+
+    pass

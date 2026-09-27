@@ -150,6 +150,19 @@ class PollWithManyToMany(models.Model):
     history = HistoricalRecords(m2m_fields=[places])
 
 
+class PollPlace(models.Model):
+    poll = models.ForeignKey("PollWithCustomThrough", on_delete=models.CASCADE)
+    place = models.ForeignKey("Place", on_delete=models.CASCADE)
+    role = models.CharField(max_length=50, default="")
+
+
+class PollWithCustomThrough(models.Model):
+    question = models.CharField(max_length=200)
+    places = models.ManyToManyField("Place", through=PollPlace)
+
+    history = HistoricalRecords(m2m_fields=[places])
+
+
 class PollWithManyToManyCustomHistoryID(models.Model):
     question = models.CharField(max_length=200)
     pub_date = models.DateTimeField("date published")

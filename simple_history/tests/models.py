@@ -596,6 +596,7 @@ class Planet(models.Model):
 class Contact(models.Model):
     name = models.CharField(max_length=30)
     email = models.EmailField(max_length=255, unique=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
     history = HistoricalRecords(table_name="contacts_history")
 
 
@@ -779,7 +780,10 @@ register(
 
 class UUIDModel(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    history = HistoricalRecords(history_id_field=models.UUIDField(default=uuid.uuid4))
+    name = models.CharField(max_length=100, null=True)
+    history = HistoricalRecords(
+        history_id_field=models.UUIDField(default=uuid.uuid4)
+    )
 
 
 class UUIDRegisterModel(models.Model):
